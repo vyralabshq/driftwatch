@@ -41,6 +41,12 @@ enum Cmd {
         /// yours with `lsblk`). Default: all devices.
         #[arg(long)]
         dev: Option<String>,
+        /// Seconds per summary window.
+        #[arg(long, default_value_t = 5)]
+        window: u64,
+        /// Also print every raw event (debug firehose).
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -53,7 +59,7 @@ async fn main() -> Result<()> {
             vote,
             interval,
         } => poll(rpc, vote, interval).await,
-        Cmd::Watch { dev } => watch(dev).await,
+        Cmd::Watch { dev, window, raw } => watch(dev, window, raw).await,
     }
 }
 
@@ -97,7 +103,7 @@ async fn poll(rpc_url: String, vote: Option<String>, interval: u64) -> Result<()
 
 /// The profiler: load the eBPF program, attach both block tracepoints, stream
 /// DiskEvents off the ringbuf.
-async fn watch(dev: Option<String>) -> Result<()> {
+async fn watch(dev: Option<String>, window: u64, raw: bool) -> Result<()> {
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
@@ -153,7 +159,7 @@ async fn watch(dev: Option<String>) -> Result<()> {
     }
 
     tokio::select! {
-        res = disk::consume(events) => res,
+        res = disk::consume(events, window, raw) => res,
         _ = signal::ctrl_c() => {
             println!("\nstopping.");
             Ok(())
