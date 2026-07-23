@@ -20,7 +20,7 @@ const DEV_OFF: usize = 8;
 const SECTOR_OFF: usize = 16;
 const NR_SECTOR_OFF: usize = 24;
 const ERROR_OFF: usize = 28; // complete only
-const RWBS_OFF: usize = 34;
+const RWBS_OFF: usize = 32;
 
 /// issue timestamps of in-flight requests, keyed by (dev, sector)
 #[map]
@@ -96,7 +96,7 @@ fn try_complete(ctx: &TracePointContext) -> Result<(), i64> {
     let error: i32 = unsafe { ctx.read_at(ERROR_OFF)? };
 
     // rwbs = flag string like "WS"; find R or W
-    let rwbs: [u8; 10] = unsafe { ctx.read_at(RWBS_OFF)? };
+    let rwbs: [u8; 8] = unsafe { ctx.read_at(RWBS_OFF)? };
     let mut rw = RW_OTHER;
     for b in rwbs {
         match b {
