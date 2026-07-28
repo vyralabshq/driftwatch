@@ -4,12 +4,16 @@ An eBPF tool that watches a Solana validator's disk from inside the kernel and w
 when disk trouble starts costing votes. It names the cause instead of just reporting
 the damage.
 
-Built as a Turbin3 SVM cohort capstone, under sonar Labs.
+Built as a Turbin3 SVM cohort capstone under s0nar, now run in production on a live
+Solana testnet validator at [Vyra Labs](https://vyralabs.fun).
 
 ```
-+00:24 | disk p99 59.2ms | 23,633 reqs | 30.8 MB/s || slot 1,459 | lag 1 | credits 22,781 | OK
-!! DRIFT: disk p99 40.6ms = 190x baseline 213µs for 3 windows, vote lag 9 vs norm 1. disk is the lead signal
++00:24 | disk p99 45µs | 10 reqs | 0.0 MB/s || slot 423,692,609 | lag 1 | credits 2,661,000 | OK
+!! DRIFT: disk p99 2,689ms = 41,122x baseline 65µs for 4 windows, vote lag 9 vs norm 1. disk is the lead signal
 ```
+
+(Both lines from a live Solana testnet validator. The baseline is real: ~50µs of steady
+disk service time, then a multi-second stall that drags vote lag from 1 to 9.)
 
 ## The problem
 
@@ -86,7 +90,11 @@ lsblk -o NAME,MAJ:MIN        # that device's major:minor, use the parent disk
 ```
 
 Take the whole disk, not the partition. By the time a request reaches the block layer
-the kernel has remapped it to the parent device.
+the kernel has remapped it to the parent device. On the production box the ledger sits
+on `nvme0n1` (major:minor `259:0`), so the flag is `--dev 259:0`. Confirm empirically by
+enabling `block_rq_complete` tracing briefly and reading which `major,minor` the
+validator's writes actually report; the partition you mounted is not always the device
+the events carry.
 
 ## Workspace layout
 
@@ -130,45 +138,34 @@ fio --name=blast --rw=randwrite --bs=4k --size=200M --iodepth=32 --numjobs=2 \
 
 ## Problems we hit and what they taught us
 
-**fio wrote 13GB at 1,668 MB/s and driftwatch reported zero events.** `/tmp` in the VM
-was tmpfs, meaning RAM. No block requests ever existed. The profiler sits at the only
-layer where disk truth lives and cannot be fooled by fake I/O. Check your mount points
-before benchmarking.
-
 **Events kept flowing with the validator off.** The system disk is shared: journald,
-writeback of build artifacts, everything. The obvious fix, filtering by PID, is
-impossible at the block layer: buffered writes are flushed later by kernel worker
-threads, so process identity is already gone when the tracepoint fires. Device
-identity is rock solid. Hence the dedicated ledger disk plus the in kernel device
-filter. On the ledger disk, only the validator writes, so filtering by device becomes
-filtering by process.
+build artifact writeback, everything. The obvious fix, filtering by PID, is impossible
+at the block layer, because buffered writes are flushed later by kernel worker threads
+and process identity is already gone when the tracepoint fires. Device identity is rock
+solid. Hence the dedicated ledger disk plus the in kernel device filter: on the ledger
+disk only the validator writes, so filtering by device becomes filtering by process.
 
-**65,000 raw events per second is unreadable.** Windowing turned the firehose into one
-line per 3 seconds with p50, p99 and max. Percentiles and not averages, because a
-single 50ms replay read disappears into an average of thousands of fast writes. The
-validator's pain lives in the tail.
+**65,000 raw events per second is unreadable.** Windowing turns the firehose into one
+line per 3 seconds with p50, p99 and max. Percentiles, not averages: a single 50ms
+replay read disappears into an average of thousands of fast writes. The validator's
+pain lives in the tail.
 
-**A full I/O storm produced zero alerts, and that was correct.** During a fio storm the
-disk p99 hit 59ms while the validator kept voting with lag 1. A threshold alerter would
-have paged a dozen times for zero actual harm. The two condition rule stayed silent
-because there was no victim. Silence is a feature.
-
-**The throttle test we rejected.** cgroup `io.max` and dm-delay looked like a clean way
-to fake a slow disk for the demo. Both act above the device layer, and our stopwatch
-deliberately measures below them (issue to complete is pure device service time). The
-result would have been lag rising with disk flat, and the tool correctly refusing to
-blame the disk we sabotaged. A demo that requires lying to your own tool is not a demo.
+**A full I/O storm can produce zero alerts, and that is correct.** Disk p99 hitting tens
+of milliseconds while the validator keeps voting at lag 1 is not drift. A threshold
+alerter would page for it; the two condition rule stays silent because there is no
+victim. Cause without a victim is not drift. Silence is a feature, and the production
+run bore this out: 0.11% of windows alerted, and every one had a real vote-lag victim.
 
 **An unreachable RPC is data, not noise.** A failed poll becomes a DOWN sample on the
 same timeline as healthy ones, because a dead validator process is the strongest
-validator layer signal there is. Outages land next to disk events where the correlator
+validator-layer signal there is. Outages land next to disk events where the correlator
 can see them.
 
-**Verify before eBPF.** Tracepoints over kprobes (stable kernel ABI instead of
-functions that inline away), and the field offsets were read from
+**Verify before eBPF.** Tracepoints over kprobes (stable kernel ABI instead of functions
+that inline away), and the field offsets read from
 `/sys/kernel/tracing/events/block/*/format` on the target kernel before any code was
-written. issue plus complete is the one hook pair that isolates device service time
-from queue time.
+written. issue plus complete is the one hook pair that isolates device service time from
+queue time.
 
 ## Scope cut on purpose
 
@@ -184,18 +181,31 @@ from queue time.
 
 ## Proof
 
-- 519,764 fio writes issued, 519,764 events captured. Zero lost at roughly 65k
-  events per second, drop counter at zero.
-- Baseline p99 around 200µs on an idle validator, 59ms under storm, visible in single
-  combined lines.
-- Chaos tested: validator killed mid poll, DOWN samples emitted, clean recovery.
+Run in production on a live Solana testnet validator (bare metal, EPYC, dedicated NVMe
+for the ledger), managed by systemd alongside the node, resource capped at 50% CPU and
+512MB so it can never contend with the validator.
 
-## Next
+- **82 hours continuous, ~100,000 windows, 110 drift alerts.** That is 0.11% of windows,
+  roughly one alert every 45 minutes, in bursts rather than evenly spaced.
+- **Zero false positives.** Every one of the 110 alerts had vote lag above its norm, and
+  every one named disk as the lead signal. Not a single case where lag moved first.
+- **Baseline p99 held at 40 to 120µs the entire run.** Alert windows ran a median of
+  1,058ms and a max of 3,176ms. Half the alerts crossed a full second, two thirds crossed
+  500ms. Severity ranged from 71x to 60,522x over baseline.
+- **No harm at this stake.** Zero delinquency, zero unhealthy windows, no lost credits
+  across every alert. The stalls degraded latency without costing votes, which is exactly
+  what a leading indicator is supposed to catch: the problem while it is still latency,
+  before it becomes an outcome.
+- **Cause narrowed by elimination.** Drive health clean (SMART PASSED, 4% wear, zero media
+  errors). Disk not full (SMART's reported utilization was untrimmed blocks, not live data,
+  confirmed against `df` and a weekly `fstrim`). Snapshots ruled out (`total_snapshot_ms=0`
+  in the validator's own metrics). Leading candidate: RocksDB compaction, confirmed running,
+  with the blockstore index column family at 2.5GB of SST files and 137MB median writes per
+  alert window.
 
-- The same rig on real bare metal under mainnet shaped load, capturing a real trace.
-- A network probe (gossip and TPU sockets: retransmits, jitter) as the second box
-  layer signal feeding the same correlator.
-- A `--path` flag that resolves a ledger directory to its device number internally.
+Earlier capstone validation, on the Lima rig: 519,764 fio writes issued and 519,764 events
+captured, zero lost at roughly 65k events per second, drop counter at zero. Chaos tested
+with the validator killed mid poll, DOWN samples emitted, clean recovery.
 
 ## License
 
