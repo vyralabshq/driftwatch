@@ -1,6 +1,5 @@
-// One timeline: latest validator sample + one line (or JSON) per disk window.
-// Drift rule: disk p99 sustained above its baseline AND lag above its norm
-// -> one alert naming disk. Both must hold; a lone spike = silence.
+// One line (or JSON) per disk window, validator sample attached.
+// Disk and lag are independent signals. Disk never triggers on its own.
 
 use std::{
     collections::VecDeque,
@@ -18,20 +17,26 @@ use crate::{
 
 const HISTORY: usize = 20; // baseline memory (windows)
 const MIN_HISTORY: usize = 5; // don't judge before this much normal history
-const ELEVATION_FACTOR: u64 = 4; // p99 must be 4x baseline...
-const P99_FLOOR_NS: u64 = 1_000_000; // ...and above 1ms (µs noise can't trip it)
-const STREAK: u32 = 3; // sustained for this many consecutive windows
-const LAG_DELTA: i64 = 3; // lag must exceed its norm by this many slots
+
+/// Disk/lag elevation thresholds, set via CLI flags.
+#[derive(Clone, Copy)]
+pub struct Thresholds {
+    pub elevation_factor: u64, // disk: multiple of baseline
+    pub p99_floor_ns: u64,     // disk: minimum floor
+    pub streak: u32,           // disk: consecutive windows required
+    pub lag_delta: i64,        // lag: slots over norm
+}
 
 /// One output per disk window, carrying the latest validator sample.
 pub async fn combine(
     mut disk_rx: Receiver<WindowStats>,
     mut rpc_rx: Receiver<Sample>,
     json_mode: bool,
+    thresholds: Thresholds,
 ) {
     let started = Instant::now();
     let mut latest: Option<Sample> = None;
-    let mut detector = DriftDetector::default();
+    let mut detector = DriftDetector::new(thresholds);
     loop {
         tokio::select! {
             s = rpc_rx.recv() => match s {
@@ -40,8 +45,8 @@ pub async fn combine(
             },
             w = disk_rx.recv() => match w {
                 Some(w) => {
-                    let drift = detector.observe(&w, latest.as_ref());
-                    emit(&w, latest.as_ref(), json_mode, started, drift.as_ref());
+                    let signals = detector.observe(&w, latest.as_ref());
+                    emit(&w, latest.as_ref(), json_mode, started, &signals);
                 }
                 None => return,
             },
@@ -49,78 +54,109 @@ pub async fn combine(
     }
 }
 
-/// A fired verdict: disk elevated AND validator feeling it.
-struct Drift {
+/// Disk telemetry, computed every window once a baseline exists. Context, not a verdict.
+struct DriftInfo {
     p99_ns: u64,
     baseline_ns: u64,
     streak: u32,
     lag: i64,
     lag_norm: i64,
+    lead_signal: Option<&'static str>, // "disk" iff disk_elevated this window
 }
 
-#[derive(Default)]
+/// disk_elevated never appears in triggered_by: disk doesn't predict votes.
+struct WindowSignals {
+    disk_elevated: bool,
+    lag_elevated: bool,
+    drift: Option<DriftInfo>,
+}
+
+impl WindowSignals {
+    fn triggered_by(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.lag_elevated {
+            v.push("lag");
+        }
+        v
+    }
+}
+
 struct DriftDetector {
-    p99_history: VecDeque<u64>, // baseline: p99 of recent normal windows
-    lag_history: VecDeque<i64>, // norm: lag of recent normal windows
-    streak: u32,
-    fired: bool, // one alert per episode
+    thresholds: Thresholds,
+    p99_history: VecDeque<u64>, // disk baseline
+    disk_streak: u32,
+    lag_history: VecDeque<i64>, // lag norm
 }
 
 impl DriftDetector {
-    fn observe(&mut self, w: &WindowStats, v: Option<&Sample>) -> Option<Drift> {
-        // idle window = no info
-        if w.reqs == 0 {
-            return None;
+    fn new(thresholds: Thresholds) -> Self {
+        Self {
+            thresholds,
+            p99_history: VecDeque::new(),
+            disk_streak: 0,
+            lag_history: VecDeque::new(),
         }
-        // too little history: just learn
-        if self.p99_history.len() < MIN_HISTORY {
-            self.remember(w, v);
-            return None;
-        }
-
-        let baseline = median_u64(&self.p99_history);
-        let elevated =
-            w.p99_ns > baseline.saturating_mul(ELEVATION_FACTOR) && w.p99_ns > P99_FLOOR_NS;
-
-        if !elevated {
-            // back to normal: feed baseline, re-arm
-            self.streak = 0;
-            self.fired = false;
-            self.remember(w, v);
-            return None;
-        }
-
-        // elevated windows are not remembered (would poison the baseline)
-        self.streak += 1;
-        if self.streak < STREAK || self.fired {
-            return None;
-        }
-
-        // disk sustained-elevated: does the validator feel it?
-        let lag_norm = median_i64(&self.lag_history);
-        let lag = match v {
-            Some(Sample::Up(s)) => s.vote_lag,
-            Some(Sample::Down { .. }) => i64::MAX, // down = worst case
-            None => return None,
-        };
-        if lag >= lag_norm + LAG_DELTA {
-            self.fired = true;
-            return Some(Drift {
-                p99_ns: w.p99_ns,
-                baseline_ns: baseline,
-                streak: self.streak,
-                lag,
-                lag_norm,
-            });
-        }
-        None
     }
 
-    fn remember(&mut self, w: &WindowStats, v: Option<&Sample>) {
-        push_capped(&mut self.p99_history, w.p99_ns);
-        if let Some(Sample::Up(s)) = v {
-            push_capped(&mut self.lag_history, s.vote_lag);
+    fn observe(&mut self, w: &WindowStats, v: Option<&Sample>) -> WindowSignals {
+        let disk_elevated = self.observe_disk(w);
+
+        let lag = match v {
+            Some(Sample::Up(s)) => Some(s.vote_lag),
+            Some(Sample::Down { .. }) => Some(i64::MAX), // down = worst case
+            None => None,
+        };
+        let lag_elevated = lag.map(|l| self.observe_lag(l)).unwrap_or(false);
+
+        let drift = (self.p99_history.len() >= MIN_HISTORY).then(|| {
+            let baseline = median_u64(&self.p99_history).max(1);
+            let lag_norm = median_i64(&self.lag_history);
+            DriftInfo {
+                p99_ns: w.p99_ns,
+                baseline_ns: baseline,
+                streak: self.disk_streak,
+                lag: lag.unwrap_or(0),
+                lag_norm,
+                lead_signal: disk_elevated.then_some("disk"),
+            }
+        });
+
+        WindowSignals {
+            disk_elevated,
+            lag_elevated,
+            drift,
         }
+    }
+
+    /// Needs `streak` consecutive elevated windows. Idle windows: no data, no change.
+    fn observe_disk(&mut self, w: &WindowStats) -> bool {
+        if w.reqs == 0 {
+            return false;
+        }
+        let baseline_ready = self.p99_history.len() >= MIN_HISTORY;
+        let raw_elevated = baseline_ready && {
+            let baseline = median_u64(&self.p99_history);
+            w.p99_ns > baseline.saturating_mul(self.thresholds.elevation_factor)
+                && w.p99_ns > self.thresholds.p99_floor_ns
+        };
+        if raw_elevated {
+            self.disk_streak += 1;
+        } else {
+            self.disk_streak = 0;
+            // don't remember elevated windows, would poison the baseline
+            push_capped(&mut self.p99_history, w.p99_ns);
+        }
+        raw_elevated && self.disk_streak >= self.thresholds.streak
+    }
+
+    /// No streak requirement: most lag episodes last one window.
+    fn observe_lag(&mut self, lag: i64) -> bool {
+        let lag_norm = median_i64(&self.lag_history);
+        let elevated = lag >= lag_norm + self.thresholds.lag_delta;
+        if !elevated {
+            push_capped(&mut self.lag_history, lag);
+        }
+        elevated
     }
 }
 
@@ -148,41 +184,38 @@ fn emit(
     v: Option<&Sample>,
     json_mode: bool,
     started: Instant,
-    drift: Option<&Drift>,
+    signals: &WindowSignals,
 ) {
     if json_mode {
-        println!("{}", to_json(w, v, drift));
+        println!("{}", to_json(w, v, signals));
     } else {
         let val = match v {
             Some(s) => output::compact(s),
             None => "validator: no sample yet".into(),
         };
-        println!("{} | {} || {}", elapsed(started), compact_stats(w), val);
-        if let Some(d) = drift {
-            let lag = if d.lag == i64::MAX {
-                "validator DOWN".into()
-            } else {
-                format!("vote lag {} vs norm {}", d.lag, d.lag_norm)
-            };
-            println!(
-                "!! DRIFT: disk p99 {} = {}x baseline {} for {} windows — {} — disk is the lead signal",
-                crate::disk::human_latency(d.p99_ns),
-                d.p99_ns / d.baseline_ns.max(1),
-                crate::disk::human_latency(d.baseline_ns),
-                d.streak,
-                lag,
-            );
-        }
+        let triggered = signals.triggered_by();
+        let suffix = if triggered.is_empty() {
+            String::new()
+        } else {
+            format!(" | !! {}", triggered.join(","))
+        };
+        println!(
+            "{} | {} || {}{}",
+            elapsed(started),
+            compact_stats(w),
+            val,
+            suffix
+        );
     }
 }
 
-fn to_json(w: &WindowStats, v: Option<&Sample>, drift: Option<&Drift>) -> String {
+fn to_json(w: &WindowStats, v: Option<&Sample>, signals: &WindowSignals) -> String {
     let validator = match v {
         Some(Sample::Up(s)) => up_json(s),
         Some(Sample::Down { reason }) => json!({ "state": "down", "reason": reason }),
         None => serde_json::Value::Null,
     };
-    let drift = match drift {
+    let drift = match &signals.drift {
         Some(d) => json!({
             "p99_us": d.p99_ns / 1_000,
             "baseline_us": d.baseline_ns / 1_000,
@@ -190,7 +223,7 @@ fn to_json(w: &WindowStats, v: Option<&Sample>, drift: Option<&Drift>) -> String
             "windows": d.streak,
             "lag": if d.lag == i64::MAX { serde_json::Value::Null } else { json!(d.lag) },
             "lag_norm": d.lag_norm,
-            "lead_signal": "disk",
+            "lead_signal": d.lead_signal,
         }),
         None => serde_json::Value::Null,
     };
@@ -210,6 +243,11 @@ fn to_json(w: &WindowStats, v: Option<&Sample>, drift: Option<&Drift>) -> String
         },
         "validator": validator,
         "drift": drift,
+        "signals": {
+            "disk_elevated": signals.disk_elevated,
+            "lag_elevated": signals.lag_elevated,
+            "triggered_by": signals.triggered_by(),
+        },
     })
     .to_string()
 }
@@ -234,7 +272,7 @@ fn epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Stopwatch since start — timezone-free for humans. JSON keeps absolute ts.
+/// Time since start, like "+02:41".
 fn elapsed(started: Instant) -> String {
     let secs = started.elapsed().as_secs();
     if secs >= 3600 {

@@ -67,6 +67,18 @@ enum Cmd {
         /// Emit JSON objects instead of human lines.
         #[arg(long)]
         json: bool,
+        /// Disk elevated: p99 this many times its baseline.
+        #[arg(long, default_value_t = 4)]
+        elevation_factor: u64,
+        /// Disk elevated: p99 above this floor, in microseconds.
+        #[arg(long, default_value_t = 1_500_000)]
+        p99_floor_us: u64,
+        /// Disk elevated: needs this many consecutive windows.
+        #[arg(long, default_value_t = 3)]
+        streak: u32,
+        /// Lag elevated: slots over its own norm.
+        #[arg(long, default_value_t = 3)]
+        lag_delta: i64,
     },
 }
 
@@ -87,7 +99,19 @@ async fn main() -> Result<()> {
             vote,
             interval,
             json,
-        } => run(dev, window, rpc, vote, interval, json).await,
+            elevation_factor,
+            p99_floor_us,
+            streak,
+            lag_delta,
+        } => {
+            let thresholds = correlate::Thresholds {
+                elevation_factor,
+                p99_floor_ns: p99_floor_us * 1_000,
+                streak,
+                lag_delta,
+            };
+            run(dev, window, rpc, vote, interval, json, thresholds).await
+        }
     }
 }
 
@@ -220,6 +244,7 @@ async fn run(
     vote: Option<String>,
     interval: u64,
     json: bool,
+    thresholds: correlate::Thresholds,
 ) -> Result<()> {
     let (_ebpf, events, drops) = load_profiler(&dev)?;
     tokio::spawn(disk::watch_drops(drops));
@@ -242,7 +267,7 @@ async fn run(
 
     tokio::select! {
         res = disk::consume(events, window, false, disk_tx) => res,
-        _ = correlate::combine(disk_rx, rpc_rx, json) => Ok(()),
+        _ = correlate::combine(disk_rx, rpc_rx, json, thresholds) => Ok(()),
         _ = signal::ctrl_c() => {
             if !json {
                 println!("\nstopping.");
