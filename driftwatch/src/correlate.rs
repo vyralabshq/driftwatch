@@ -8,6 +8,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use libc::{RUSAGE_SELF, getrusage, rusage};
+
 use serde_json::json;
 use tokio::sync::mpsc::Receiver;
 
@@ -34,16 +36,21 @@ pub struct Thresholds {
 }
 
 /// One output per disk window, carrying the latest validator sample.
+/// dry_run: emit exactly one window then return, instead of looping forever.
+/// self_metrics: attach driftwatch's own CPU time (user+sys) for that window.
 pub async fn combine(
     mut disk_rx: Receiver<WindowStats>,
     mut rpc_rx: Receiver<Sample>,
     json_mode: bool,
     thresholds: Thresholds,
     mut net: NetTracker,
+    dry_run: bool,
+    self_metrics: bool,
 ) {
     let started = Instant::now();
     let mut latest: Option<Sample> = None;
     let mut engine = AlertEngine::new(thresholds);
+    let mut cpu = self_metrics.then(SelfCpu::new);
     loop {
         tokio::select! {
             s = rpc_rx.recv() => match s {
@@ -57,12 +64,44 @@ pub async fn combine(
                     let freeze = engine.observe_slot(latest.as_ref());
                     let net_sample = net.sample();
                     let alerts = build_alerts(&disk, vote_lag_alert, &freeze, &net_sample, &thresholds);
-                    emit(&w, latest.as_ref(), json_mode, started, &disk, &freeze, &alerts, &net_sample);
+                    let self_cpu_ms = cpu.as_mut().map(|c| c.delta_ms());
+                    emit(&w, latest.as_ref(), json_mode, started, &disk, &freeze, &alerts, &net_sample, net.parse_errors(), self_cpu_ms);
+                    if dry_run {
+                        return;
+                    }
                 }
                 None => return,
             },
         }
     }
+}
+
+/// Wraps getrusage(RUSAGE_SELF): real CPU time driftwatch itself burns,
+/// not wall clock. Answers "is driftwatch perturbing the node."
+struct SelfCpu {
+    last_ms: i64,
+}
+
+impl SelfCpu {
+    fn new() -> Self {
+        Self { last_ms: total_cpu_ms() }
+    }
+
+    /// CPU ms consumed since the last call (or since new()).
+    fn delta_ms(&mut self) -> u64 {
+        let now = total_cpu_ms();
+        let delta = (now - self.last_ms).max(0) as u64;
+        self.last_ms = now;
+        delta
+    }
+}
+
+fn total_cpu_ms() -> i64 {
+    let mut usage: rusage = unsafe { std::mem::zeroed() };
+    unsafe { getrusage(RUSAGE_SELF, &mut usage) };
+    let user_ms = usage.ru_utime.tv_sec * 1000 + usage.ru_utime.tv_usec / 1000;
+    let sys_ms = usage.ru_stime.tv_sec * 1000 + usage.ru_stime.tv_usec / 1000;
+    user_ms + sys_ms
 }
 
 /// Disk-side result: the alert decision plus the informational median
@@ -284,9 +323,11 @@ fn emit(
     freeze: &FreezeState,
     alerts: &[&str],
     net: &Option<NetSample>,
+    net_parse_errors: u64,
+    self_cpu_ms: Option<u64>,
 ) {
     if json_mode {
-        println!("{}", to_json(w, v, disk, freeze, alerts, net));
+        println!("{}", to_json(w, v, disk, freeze, alerts, net, net_parse_errors, self_cpu_ms));
     } else {
         let val = match v {
             Some(s) => output::compact(s),
@@ -314,6 +355,8 @@ fn to_json(
     freeze: &FreezeState,
     alerts: &[&str],
     net: &Option<NetSample>,
+    net_parse_errors: u64,
+    self_cpu_ms: Option<u64>,
 ) -> String {
     let validator = match v {
         Some(Sample::Up(s)) => up_json(s),
@@ -323,7 +366,7 @@ fn to_json(
     let net_json = match net {
         Some(n) => json!({
             "iface": &n.iface,
-            "is_xdp": serde_json::Value::Null, // not yet implemented
+            "is_xdp": n.is_xdp,
             "ring": {
                 "rx_missed_errors": n.ring.rx_missed_errors,
                 "rx_dropped": n.ring.rx_dropped,
@@ -346,6 +389,7 @@ fn to_json(
             },
             "sockets": [], // layer 4, P1: always empty for now
             "counters_reset": n.counters_reset,
+            "parse_errors": net_parse_errors,
         }),
         None => serde_json::Value::Null,
     };
@@ -353,6 +397,7 @@ fn to_json(
         "ts": epoch_secs(),
         "schema_version": 2,
         "consensus": "towerbft",
+        "self_cpu_ms": self_cpu_ms,
         "disk": {
             "window_secs": w.window_secs,
             "reqs": w.reqs,
