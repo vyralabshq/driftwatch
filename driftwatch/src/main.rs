@@ -3,6 +3,7 @@ mod disk;
 mod net;
 mod output;
 mod rpc;
+mod sockets;
 
 use std::time::Duration;
 
@@ -92,9 +93,22 @@ enum Cmd {
         /// udp_rcvbuf alert: RcvbufErrors delta above this.
         #[arg(long, default_value_t = 0)]
         udp_rcvbuf_threshold: u64,
+        /// socket_drop alert: any single agave socket's drops delta above this.
+        #[arg(long, default_value_t = 0)]
+        socket_drop_threshold: u64,
         /// Network interface to read counters from. Default: kernel's default-route interface.
         #[arg(long)]
         iface: Option<String>,
+        /// agave-validator PID. Default: auto-detect by matching argv[0].
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Seconds between fd map / port role rebuilds. Slow on purpose.
+        #[arg(long, default_value_t = 30)]
+        fd_refresh: u64,
+        /// Seconds between layer-4 socket samples. Decoupled from --window since
+        /// the fd walk + proc scan + RPC role lookup are heavier than layers 1-3.
+        #[arg(long, default_value_t = 5)]
+        socket_interval: u64,
         /// Emit exactly one window then exit, instead of running forever.
         #[arg(long)]
         dry_run: bool,
@@ -132,7 +146,11 @@ async fn main() -> Result<()> {
             ring_drop_threshold,
             napi_squeeze_threshold,
             udp_rcvbuf_threshold,
+            socket_drop_threshold,
             iface,
+            pid,
+            fd_refresh,
+            socket_interval,
             dry_run,
             check,
             self_metrics,
@@ -146,6 +164,7 @@ async fn main() -> Result<()> {
                 ring_drop_threshold,
                 napi_squeeze_threshold,
                 udp_rcvbuf_threshold,
+                socket_drop_threshold,
             };
             let iface = match iface {
                 Some(i) => i,
@@ -154,11 +173,13 @@ async fn main() -> Result<()> {
             };
 
             if check {
-                return run_check(&dev, &rpc, vote, &iface).await;
+                return run_check(&dev, &rpc, vote, &iface, pid).await;
             }
 
             eprintln!("driftwatch: using interface {iface}");
-            log_active_layers(&iface, dry_run, self_metrics);
+            let mut socket_tracker = sockets::SocketTracker::new(rpc.clone(), pid, fd_refresh);
+            let startup_sockets = socket_tracker.sample().await;
+            log_active_layers(&iface, dry_run, self_metrics, &startup_sockets);
             let net = net::NetTracker::new(iface);
             run(
                 dev,
@@ -169,6 +190,8 @@ async fn main() -> Result<()> {
                 json,
                 thresholds,
                 net,
+                socket_tracker,
+                socket_interval,
                 dry_run,
                 self_metrics,
             )
@@ -178,12 +201,23 @@ async fn main() -> Result<()> {
 }
 
 /// Summarizes which layers are active vs skipped, and why, before the main loop starts.
-fn log_active_layers(iface: &str, dry_run: bool, self_metrics: bool) {
+fn log_active_layers(iface: &str, dry_run: bool, self_metrics: bool, startup_sockets: &sockets::SocketSample) {
     eprintln!("driftwatch: layers active:");
     eprintln!("  disk (eBPF block tracepoints): active");
     eprintln!("  rpc (vote lag / slot freeze): active");
     eprintln!("  net layer 1-3 (ring/softnet/snmp, iface {iface}): active");
-    eprintln!("  net layer 4 (per-socket agave attribution): skipped, not implemented (P1)");
+    match startup_sockets.pid {
+        Some(pid) => eprintln!(
+            "  net layer 4 (per-socket agave attribution, pid {pid}): active, {} sockets found",
+            startup_sockets.sockets.len()
+        ),
+        None => eprintln!(
+            "  net layer 4 (per-socket agave attribution): active but agave process not found yet, sockets will be empty"
+        ),
+    }
+    if startup_sockets.pid.is_some() && startup_sockets.sockets.is_empty() {
+        eprintln!("  !! layer 4 found the agave process but zero sockets attributed to it, check --pid / port roles");
+    }
     eprintln!(
         "  self_metrics (own CPU time): {}",
         if self_metrics { "active" } else { "skipped, --self-metrics not passed" }
@@ -194,8 +228,19 @@ fn log_active_layers(iface: &str, dry_run: bool, self_metrics: bool) {
 }
 
 /// Validates eBPF load, network paths, and RPC reachability without entering the main loop.
-async fn run_check(dev: &Option<String>, rpc_url: &str, vote: Option<String>, iface: &str) -> Result<()> {
+async fn run_check(
+    dev: &Option<String>,
+    rpc_url: &str,
+    vote: Option<String>,
+    iface: &str,
+    pid: Option<u32>,
+) -> Result<()> {
     let mut ok = true;
+
+    match sockets::resolve_pid(pid) {
+        Some(found) => println!("[ok]   agave process found: pid {found}"),
+        None => println!("[warn] agave process not found (--pid to override), layer 4 will report empty until it starts"),
+    }
 
     match load_profiler(dev) {
         Ok(_profiler) => println!("[ok]   eBPF load + attach (block_rq_issue, block_rq_complete)"),
@@ -366,6 +411,8 @@ async fn run(
     json: bool,
     thresholds: correlate::Thresholds,
     net: net::NetTracker,
+    socket_tracker: sockets::SocketTracker,
+    socket_interval: u64,
     dry_run: bool,
     self_metrics: bool,
 ) -> Result<()> {
@@ -386,11 +433,13 @@ async fn run(
 
     let (disk_tx, disk_rx) = tokio::sync::mpsc::channel(64);
     let (rpc_tx, rpc_rx) = tokio::sync::mpsc::channel(16);
+    let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(rpc::poll_stream(poller, interval, rpc_tx));
+    tokio::spawn(sockets::socket_stream(socket_tracker, socket_interval, socket_tx));
 
     tokio::select! {
         res = disk::consume(events, window, false, disk_tx) => res,
-        _ = correlate::combine(disk_rx, rpc_rx, json, thresholds, net, dry_run, self_metrics) => Ok(()),
+        _ = correlate::combine(disk_rx, rpc_rx, socket_rx, json, thresholds, net, dry_run, self_metrics) => Ok(()),
         _ = signal::ctrl_c() => {
             if !json {
                 println!("\nstopping.");
