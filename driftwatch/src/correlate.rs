@@ -1,5 +1,7 @@
 // One line (or JSON) per disk window, validator sample attached.
-// Disk and lag are independent signals. Disk never triggers on its own.
+// Every alert is an independent static threshold. No composite alert, ever:
+// that AND-gating (slow disk AND high lag) was v1's actual defect. See
+// V2_PLAN.md for the full reasoning.
 
 use std::{
     collections::VecDeque,
@@ -11,23 +13,24 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::{
     disk::{WindowStats, compact_stats},
-    net::NetTracker,
+    net::{NetSample, NetTracker},
     output,
     rpc::{Sample, ValidatorSample},
 };
 
-const HISTORY: usize = 20; // baseline memory (windows)
-const MIN_HISTORY: usize = 5; // don't judge before this much normal history
+const HISTORY: usize = 20; // depth of the informational disk-median window
 
-/// Disk/lag elevation thresholds, set via CLI flags.
+/// Every alert threshold, set via CLI flags. Static: nothing here adapts.
 #[derive(Clone, Copy)]
 pub struct Thresholds {
-    pub elevation_factor: u64, // disk: multiple of baseline
-    pub p99_floor_ns: u64,     // disk: minimum floor
-    pub streak: u32,           // disk: consecutive windows required
-    pub lag_delta: i64,        // lag: slots over norm
-    pub freeze_min_secs: f64,  // freeze: wall-clock seconds before it counts
-    pub freeze_jump_bound: i64, // freeze: slot jump this big = discontinuity
+    pub disk_latency_ns: u64,        // disk p99 over this = elevated
+    pub disk_streak: u32,            // consecutive elevated windows required
+    pub vote_lag: i64,               // absolute slots
+    pub freeze_lookback: u32,        // windows, for freeze_in_last_n
+    pub freeze_jump_bound: i64,      // slot jump this big = discontinuity
+    pub ring_drop_threshold: u64,    // rx_missed_errors delta
+    pub napi_squeeze_threshold: u64, // time_squeeze delta
+    pub udp_rcvbuf_threshold: u64,   // RcvbufErrors delta
 }
 
 /// One output per disk window, carrying the latest validator sample.
@@ -40,7 +43,7 @@ pub async fn combine(
 ) {
     let started = Instant::now();
     let mut latest: Option<Sample> = None;
-    let mut detector = DriftDetector::new(thresholds);
+    let mut engine = AlertEngine::new(thresholds);
     loop {
         tokio::select! {
             s = rpc_rx.recv() => match s {
@@ -49,9 +52,12 @@ pub async fn combine(
             },
             w = disk_rx.recv() => match w {
                 Some(w) => {
-                    let signals = detector.observe(&w, latest.as_ref());
+                    let disk = engine.observe_disk(&w);
+                    let vote_lag_alert = engine.observe_lag(latest.as_ref());
+                    let freeze = engine.observe_slot(latest.as_ref());
                     let net_sample = net.sample();
-                    emit(&w, latest.as_ref(), json_mode, started, &signals, &net_sample);
+                    let alerts = build_alerts(&disk, vote_lag_alert, &freeze, &net_sample, &thresholds);
+                    emit(&w, latest.as_ref(), json_mode, started, &disk, &freeze, &alerts, &net_sample);
                 }
                 None => return,
             },
@@ -59,253 +65,211 @@ pub async fn combine(
     }
 }
 
-/// Disk telemetry, computed every window once a baseline exists. Context, not a verdict.
-struct DriftInfo {
-    p99_ns: u64,
-    baseline_ns: u64,
-    streak: u32,
-    lag: i64,
-    lag_norm: i64,
-    lead_signal: Option<&'static str>, // "disk" iff disk_elevated this window
+/// Disk-side result: the alert decision plus the informational median
+/// (never a decision input itself — see V2_PLAN.md §2.1).
+struct DiskResult {
+    alert: bool,
+    median_us: Option<u64>,
 }
 
-/// disk_elevated never appears in triggered_by: disk doesn't predict votes.
-struct WindowSignals {
-    disk_elevated: bool,
-    lag_elevated: bool,
-    slot_frozen: bool,
-    drift: Option<DriftInfo>,
-    slot_state: SlotState,
+struct FreezeState {
+    freeze: bool,
+    freeze_duration_ms: u64,
+    freeze_in_last_n: u32,
 }
 
-impl WindowSignals {
-    fn triggered_by(&self) -> Vec<&'static str> {
-        let mut v = Vec::new();
-        if self.lag_elevated {
-            v.push("lag");
-        }
-        if self.slot_frozen {
-            v.push("freeze");
-        }
-        v
-    }
-}
-
-/// What observe_disk actually compared against, so drift can report the same
-/// number it decided with (not a value recomputed after mutating history).
-struct DiskObservation {
-    elevated: bool,
-    baseline_ns: u64,
-}
-
-struct LagObservation {
-    elevated: bool,
-    lag_norm: i64,
-}
-
-#[derive(Clone, Copy)]
-struct SlotState {
-    advance: i64,
-    frozen: bool,
-    freeze_windows: u32,
-    freeze_duration_s: f64,
-}
-
-struct DriftDetector {
+struct AlertEngine {
     thresholds: Thresholds,
-    p99_history: VecDeque<u64>, // disk baseline
-    disk_streak: u32,
-    lag_history: VecDeque<i64>, // lag norm
+    disk_median_history: VecDeque<u64>, // informational only, no decisions branch on this
+    disk_streak_count: u32,
     slot: SlotTracker,
 }
 
 struct SlotTracker {
     prev_slot: Option<u64>,
-    freeze_windows: u32,
     freeze_started_at: Option<Instant>,
-    freeze_announced: bool, // one-shot: already logged this episode's freeze
+    recent_freezes: VecDeque<bool>,
+    announced: bool, // one-shot stderr line per freeze episode
 }
 
-impl DriftDetector {
+impl AlertEngine {
     fn new(thresholds: Thresholds) -> Self {
         Self {
             thresholds,
-            p99_history: VecDeque::new(),
-            disk_streak: 0,
-            lag_history: VecDeque::new(),
+            disk_median_history: VecDeque::new(),
+            disk_streak_count: 0,
             slot: SlotTracker {
                 prev_slot: None,
-                freeze_windows: 0,
                 freeze_started_at: None,
-                freeze_announced: false,
+                recent_freezes: VecDeque::new(),
+                announced: false,
             },
         }
     }
 
-    fn observe(&mut self, w: &WindowStats, v: Option<&Sample>) -> WindowSignals {
-        let disk_obs = self.observe_disk(w);
+    /// Idle windows (no requests): no new data, streak and median untouched.
+    /// Non-elevated windows feed the median so it stays representative of
+    /// "normal"; elevated windows don't (same reasoning as before, just no
+    /// longer feeding a decision, only a reported field).
+    fn observe_disk(&mut self, w: &WindowStats) -> DiskResult {
+        if w.reqs == 0 {
+            return DiskResult {
+                alert: false,
+                median_us: median_option(&self.disk_median_history),
+            };
+        }
+        let over = w.p99_ns > self.thresholds.disk_latency_ns;
+        if over {
+            self.disk_streak_count += 1;
+        } else {
+            self.disk_streak_count = 0;
+            push_capped(&mut self.disk_median_history, w.p99_ns, HISTORY);
+        }
+        DiskResult {
+            alert: over && self.disk_streak_count >= self.thresholds.disk_streak.max(1),
+            median_us: median_option(&self.disk_median_history),
+        }
+    }
 
+    /// Absolute threshold, no baseline. Sample::Down counts as worst case.
+    fn observe_lag(&self, v: Option<&Sample>) -> bool {
         let lag = match v {
             Some(Sample::Up(s)) => Some(s.vote_lag),
-            Some(Sample::Down { .. }) => Some(i64::MAX), // down = worst case
+            Some(Sample::Down { .. }) => Some(i64::MAX),
             None => None,
         };
-        let lag_obs = lag.map(|l| self.observe_lag(l));
+        lag.map(|l| l >= self.thresholds.vote_lag).unwrap_or(false)
+    }
 
-        // freeze tracking advances only on a real slot reading (Sample::Up);
-        // an RPC outage pauses it rather than advancing or resetting it
+    fn observe_slot(&mut self, v: Option<&Sample>) -> FreezeState {
         let up_slot = match v {
             Some(Sample::Up(s)) => Some(s.network_slot),
             _ => None,
         };
-        let slot_state = self.observe_slot(up_slot);
-        let slot_frozen = slot_state.freeze_duration_s >= self.thresholds.freeze_min_secs;
-        if slot_frozen && !self.slot.freeze_announced {
-            self.slot.freeze_announced = true;
-            eprintln!(
-                "!! FREEZE: slot has not advanced for {:.1}s ({} windows)",
-                slot_state.freeze_duration_s, slot_state.freeze_windows
-            );
-        }
-
-        let drift = (self.p99_history.len() >= MIN_HISTORY).then(|| DriftInfo {
-            p99_ns: w.p99_ns,
-            baseline_ns: disk_obs.baseline_ns.max(1),
-            streak: self.disk_streak,
-            lag: lag.unwrap_or(0),
-            lag_norm: lag_obs.as_ref().map(|o| o.lag_norm).unwrap_or(0),
-            lead_signal: disk_obs.elevated.then_some("disk"),
-        });
-
-        WindowSignals {
-            disk_elevated: disk_obs.elevated,
-            lag_elevated: lag_obs.map(|o| o.elevated).unwrap_or(false),
-            slot_frozen,
-            drift,
-            slot_state,
-        }
+        self.slot.observe(
+            up_slot,
+            self.thresholds.freeze_jump_bound,
+            self.thresholds.freeze_lookback,
+        )
     }
+}
 
-    /// Needs `streak` consecutive elevated windows. Idle windows: no data, no change.
-    /// Reports the baseline it actually compared against (pre-push), so drift
-    /// never shows a number contaminated by this window's own value.
-    fn observe_disk(&mut self, w: &WindowStats) -> DiskObservation {
-        if w.reqs == 0 {
-            return DiskObservation {
-                elevated: false,
-                baseline_ns: median_u64(&self.p99_history),
-            };
-        }
-        let baseline = median_u64(&self.p99_history); // snapshot before any push
-        let baseline_ready = self.p99_history.len() >= MIN_HISTORY;
-        let raw_elevated = baseline_ready
-            && w.p99_ns > baseline.saturating_mul(self.thresholds.elevation_factor)
-            && w.p99_ns > self.thresholds.p99_floor_ns;
-        if raw_elevated {
-            self.disk_streak += 1;
-        } else {
-            self.disk_streak = 0;
-            // don't remember elevated windows, would poison the baseline
-            push_capped(&mut self.p99_history, w.p99_ns);
-        }
-        DiskObservation {
-            elevated: raw_elevated && self.disk_streak >= self.thresholds.streak,
-            baseline_ns: baseline,
-        }
-    }
-
-    /// No streak requirement: most lag episodes last one window.
-    /// Reports the norm it actually compared against (pre-push).
-    fn observe_lag(&mut self, lag: i64) -> LagObservation {
-        let lag_norm = median_i64(&self.lag_history); // snapshot before any push
-        let elevated = lag >= lag_norm + self.thresholds.lag_delta;
-        if !elevated {
-            push_capped(&mut self.lag_history, lag);
-        }
-        LagObservation { elevated, lag_norm }
-    }
-
-    /// Slot advance + freeze tracking. Only called with a real slot (Sample::Up).
-    fn observe_slot(&mut self, slot: Option<u64>) -> SlotState {
+impl SlotTracker {
+    /// Advances only on a real slot reading. An RPC outage pauses this
+    /// (returns the last known state) rather than advancing or resetting it.
+    fn observe(&mut self, slot: Option<u64>, jump_bound: i64, lookback: u32) -> FreezeState {
         let Some(slot) = slot else {
-            // no fresh sample this window: pause, report last known state
-            return SlotState {
-                advance: 0,
-                frozen: false,
-                freeze_windows: self.slot.freeze_windows,
-                freeze_duration_s: self
-                    .slot
-                    .freeze_started_at
-                    .map(|t| t.elapsed().as_secs_f64())
-                    .unwrap_or(0.0),
+            return FreezeState {
+                freeze: false,
+                freeze_duration_ms: self.current_freeze_ms(),
+                freeze_in_last_n: self.count_recent_freezes(),
             };
         };
 
-        let Some(prev) = self.slot.prev_slot else {
-            self.slot.prev_slot = Some(slot);
-            return SlotState {
-                advance: 0,
-                frozen: false,
-                freeze_windows: 0,
-                freeze_duration_s: 0.0,
+        let Some(prev) = self.prev_slot else {
+            self.prev_slot = Some(slot);
+            return FreezeState {
+                freeze: false,
+                freeze_duration_ms: 0,
+                freeze_in_last_n: 0,
             };
         };
 
         let advance = slot as i64 - prev as i64;
-        self.slot.prev_slot = Some(slot);
+        self.prev_slot = Some(slot);
 
-        if advance < 0 || advance > self.thresholds.freeze_jump_bound {
+        if advance < 0 || advance > jump_bound {
             eprintln!("!! DISCONTINUITY: slot jumped by {advance} (restart or resync)");
-            self.slot.freeze_windows = 0;
-            self.slot.freeze_started_at = None;
-            self.slot.freeze_announced = false;
-            return SlotState {
-                advance,
-                frozen: false,
-                freeze_windows: 0,
-                freeze_duration_s: 0.0,
+            self.freeze_started_at = None;
+            self.recent_freezes.clear();
+            self.announced = false;
+            return FreezeState {
+                freeze: false,
+                freeze_duration_ms: 0,
+                freeze_in_last_n: 0,
             };
         }
 
-        if advance == 0 {
-            self.slot.freeze_windows += 1;
-            self.slot.freeze_started_at.get_or_insert_with(Instant::now);
+        let frozen = advance == 0;
+        if frozen {
+            self.freeze_started_at.get_or_insert_with(Instant::now);
+            if !self.announced {
+                self.announced = true;
+                eprintln!("!! FREEZE: slot stopped advancing");
+            }
         } else {
-            self.slot.freeze_windows = 0;
-            self.slot.freeze_started_at = None;
-            self.slot.freeze_announced = false;
+            self.freeze_started_at = None;
+            self.announced = false;
         }
+        push_capped(&mut self.recent_freezes, frozen, lookback.max(1) as usize);
 
-        SlotState {
-            advance,
-            frozen: advance == 0,
-            freeze_windows: self.slot.freeze_windows,
-            freeze_duration_s: self
-                .slot
-                .freeze_started_at
-                .map(|t| t.elapsed().as_secs_f64())
-                .unwrap_or(0.0),
+        FreezeState {
+            freeze: frozen,
+            freeze_duration_ms: self.current_freeze_ms(),
+            freeze_in_last_n: self.count_recent_freezes(),
         }
+    }
+
+    fn current_freeze_ms(&self) -> u64 {
+        self.freeze_started_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn count_recent_freezes(&self) -> u32 {
+        self.recent_freezes.iter().filter(|&&f| f).count() as u32
     }
 }
 
-fn push_capped<T>(q: &mut VecDeque<T>, v: T) {
-    if q.len() == HISTORY {
+/// Independent alerts only. disk_latency/vote_lag/slot_freeze from the disk
+/// window and validator sample; ring_drop/napi_squeeze/udp_rcvbuf from the
+/// network layers (layers 1-3). socket_drop needs layer 4 (P1), never fires yet.
+fn build_alerts(
+    disk: &DiskResult,
+    vote_lag_alert: bool,
+    freeze: &FreezeState,
+    net: &Option<NetSample>,
+    t: &Thresholds,
+) -> Vec<&'static str> {
+    let mut a = Vec::new();
+    if disk.alert {
+        a.push("disk_latency");
+    }
+    if vote_lag_alert {
+        a.push("vote_lag");
+    }
+    if freeze.freeze {
+        a.push("slot_freeze");
+    }
+    if let Some(n) = net {
+        if n.ring.rx_missed_errors > t.ring_drop_threshold {
+            a.push("ring_drop");
+        }
+        if n.softnet.time_squeeze > t.napi_squeeze_threshold {
+            a.push("napi_squeeze");
+        }
+        if n.snmp_udp.rcvbuf_errors > t.udp_rcvbuf_threshold {
+            a.push("udp_rcvbuf");
+        }
+    }
+    a
+}
+
+fn push_capped<T>(q: &mut VecDeque<T>, v: T, cap: usize) {
+    let cap = cap.max(1);
+    while q.len() >= cap {
         q.pop_front();
     }
     q.push_back(v);
 }
 
-fn median_u64(q: &VecDeque<u64>) -> u64 {
+fn median_option(q: &VecDeque<u64>) -> Option<u64> {
+    if q.is_empty() {
+        return None;
+    }
     let mut v: Vec<u64> = q.iter().copied().collect();
     v.sort_unstable();
-    if v.is_empty() { 0 } else { v[v.len() / 2] }
-}
-
-fn median_i64(q: &VecDeque<i64>) -> i64 {
-    let mut v: Vec<i64> = q.iter().copied().collect();
-    v.sort_unstable();
-    if v.is_empty() { 0 } else { v[v.len() / 2] }
+    Some(v[v.len() / 2] / 1_000) // ns -> us
 }
 
 fn emit(
@@ -313,21 +277,22 @@ fn emit(
     v: Option<&Sample>,
     json_mode: bool,
     started: Instant,
-    signals: &WindowSignals,
-    net: &Option<crate::net::NetSample>,
+    disk: &DiskResult,
+    freeze: &FreezeState,
+    alerts: &[&str],
+    net: &Option<NetSample>,
 ) {
     if json_mode {
-        println!("{}", to_json(w, v, signals, net));
+        println!("{}", to_json(w, v, disk, freeze, alerts, net));
     } else {
         let val = match v {
             Some(s) => output::compact(s),
             None => "validator: no sample yet".into(),
         };
-        let triggered = signals.triggered_by();
-        let suffix = if triggered.is_empty() {
+        let suffix = if alerts.is_empty() {
             String::new()
         } else {
-            format!(" | !! {}", triggered.join(","))
+            format!(" | !! {}", alerts.join(","))
         };
         println!(
             "{} | {} || {}{}",
@@ -342,41 +307,49 @@ fn emit(
 fn to_json(
     w: &WindowStats,
     v: Option<&Sample>,
-    signals: &WindowSignals,
-    net: &Option<crate::net::NetSample>,
+    disk: &DiskResult,
+    freeze: &FreezeState,
+    alerts: &[&str],
+    net: &Option<NetSample>,
 ) -> String {
     let validator = match v {
         Some(Sample::Up(s)) => up_json(s),
         Some(Sample::Down { reason }) => json!({ "state": "down", "reason": reason }),
         None => serde_json::Value::Null,
     };
-    let drift = match &signals.drift {
-        Some(d) => json!({
-            "p99_us": d.p99_ns / 1_000,
-            "baseline_us": d.baseline_ns / 1_000,
-            "factor": d.p99_ns / d.baseline_ns.max(1),
-            "windows": d.streak,
-            "lag": if d.lag == i64::MAX { serde_json::Value::Null } else { json!(d.lag) },
-            "lag_norm": d.lag_norm,
-            "lead_signal": d.lead_signal,
-        }),
-        None => serde_json::Value::Null,
-    };
     let net_json = match net {
         Some(n) => json!({
             "iface": &n.iface,
-            "rx_packets": n.rx_packets, "rx_bytes": n.rx_bytes, "rx_errs": n.rx_errs,
-            "rx_drop": n.rx_drop, "rx_fifo": n.rx_fifo,
-            "tx_packets": n.tx_packets, "tx_drop": n.tx_drop,
-            "softnet_processed": n.softnet_processed,
-            "softnet_dropped": n.softnet_dropped,
-            "softnet_time_squeeze": n.softnet_time_squeeze,
-            "softnet_top_cpus": &n.softnet_top_cpus,
+            "is_xdp": serde_json::Value::Null, // not yet implemented
+            "ring": {
+                "rx_missed_errors": n.ring.rx_missed_errors,
+                "rx_dropped": n.ring.rx_dropped,
+                "rx_errors": n.ring.rx_errors,
+                "rx_fifo_errors": n.ring.rx_fifo_errors,
+            },
+            "softnet": {
+                "processed": n.softnet.processed,
+                "dropped": n.softnet.dropped,
+                "time_squeeze": n.softnet.time_squeeze,
+                "time_squeeze_max_cpu": n.softnet.time_squeeze_max_cpu,
+                "max_cpu_id": n.softnet.max_cpu_id,
+            },
+            "snmp_udp": {
+                "in_datagrams": n.snmp_udp.in_datagrams,
+                "in_errors": n.snmp_udp.in_errors,
+                "rcvbuf_errors": n.snmp_udp.rcvbuf_errors,
+                "sndbuf_errors": n.snmp_udp.sndbuf_errors,
+                "no_ports": n.snmp_udp.no_ports,
+            },
+            "sockets": [], // layer 4, P1: always empty for now
+            "counters_reset": n.counters_reset,
         }),
         None => serde_json::Value::Null,
     };
     json!({
         "ts": epoch_secs(),
+        "schema_version": 2,
+        "consensus": "towerbft",
         "disk": {
             "window_secs": w.window_secs,
             "reqs": w.reqs,
@@ -390,19 +363,11 @@ fn to_json(
             "max_us": w.max_ns / 1_000,
         },
         "validator": validator,
-        "drift": drift,
-        "signals": {
-            "disk_elevated": signals.disk_elevated,
-            "lag_elevated": signals.lag_elevated,
-            "slot_frozen": signals.slot_frozen,
-            "triggered_by": signals.triggered_by(),
-        },
-        "slot_state": {
-            "advance": signals.slot_state.advance,
-            "frozen": signals.slot_state.frozen,
-            "freeze_windows": signals.slot_state.freeze_windows,
-            "freeze_duration_s": signals.slot_state.freeze_duration_s,
-        },
+        "baseline": { "disk_p99_median_us": disk.median_us },
+        "freeze": freeze.freeze,
+        "freeze_duration_ms": freeze.freeze_duration_ms,
+        "freeze_in_last_n": freeze.freeze_in_last_n,
+        "alerts": alerts,
         "net": net_json,
     })
     .to_string()
