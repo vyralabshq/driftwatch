@@ -118,6 +118,9 @@ impl AlertEngine {
                 median_us: median_option(&self.disk_median_history),
             };
         }
+        // snapshot before any push: the reported median must never include
+        // this window's own value, same reasoning as the original P0a fix
+        let median_us = median_option(&self.disk_median_history);
         let over = w.p99_ns > self.thresholds.disk_latency_ns;
         if over {
             self.disk_streak_count += 1;
@@ -127,7 +130,7 @@ impl AlertEngine {
         }
         DiskResult {
             alert: over && self.disk_streak_count >= self.thresholds.disk_streak.max(1),
-            median_us: median_option(&self.disk_median_history),
+            median_us,
         }
     }
 

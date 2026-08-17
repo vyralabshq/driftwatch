@@ -41,7 +41,6 @@ struct SoftnetCounters {
 #[derive(Clone, Copy, Default)]
 struct SnmpUdpCounters {
     in_datagrams: u64,
-    out_datagrams: u64,
     in_errors: u64,
     rcvbuf_errors: u64,
     sndbuf_errors: u64,
@@ -251,7 +250,6 @@ fn read_snmp_udp() -> Result<SnmpUdpCounters, String> {
         };
         return Ok(SnmpUdpCounters {
             in_datagrams: get("InDatagrams"),
-            out_datagrams: get("OutDatagrams"),
             in_errors: get("InErrors"),
             rcvbuf_errors: get("RcvbufErrors"),
             sndbuf_errors: get("SndbufErrors"),
