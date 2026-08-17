@@ -1,8 +1,13 @@
-// Network ingest counters: /proc/net/dev + /proc/net/softnet_stat, delta per
-// window. Both are sub-millisecond synchronous reads, called straight from
-// the disk-window cadence, no separate task needed.
+// Network ingest, layers 1-3 (pure /proc + /sys reads, no eBPF). Layer 4
+// (per-socket -> agave role attribution) is P1, not implemented here yet;
+// `sockets` is always emitted empty until it lands.
+//
+// All counters are cumulative-since-boot: emit deltas over the window, and
+// flag counters_reset when any counter went backwards (reboot / iface reset,
+// delta meaningless that window).
 
-use std::{collections::HashMap, fs};
+use std::collections::HashMap;
+use std::fs;
 
 pub struct NetTracker {
     iface: String,
@@ -10,21 +15,19 @@ pub struct NetTracker {
     last_err: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Raw {
-    dev: DevCounters,
+    ring: RingCounters,
     softnet: SoftnetCounters,
+    snmp_udp: SnmpUdpCounters,
 }
 
 #[derive(Clone, Copy, Default)]
-struct DevCounters {
-    rx_bytes: u64,
-    rx_packets: u64,
-    rx_errs: u64,
-    rx_drop: u64,
-    rx_fifo: u64,
-    tx_packets: u64,
-    tx_drop: u64,
+struct RingCounters {
+    rx_missed_errors: u64,
+    rx_dropped: u64,
+    rx_errors: u64,
+    rx_fifo_errors: u64,
 }
 
 #[derive(Clone, Default)]
@@ -32,25 +35,52 @@ struct SoftnetCounters {
     processed: u64,
     dropped: u64,
     time_squeeze: u64,
-    per_cpu_squeeze: HashMap<u32, u64>, // cpu id -> time_squeeze
+    per_cpu_time_squeeze: HashMap<u32, u64>,
 }
 
-/// One window's network deltas. None fields mean "couldn't compute this tick"
-/// (first tick, wraparound, or a read/parse failure), never a fabricated 0.
+#[derive(Clone, Copy, Default)]
+struct SnmpUdpCounters {
+    in_datagrams: u64,
+    out_datagrams: u64,
+    in_errors: u64,
+    rcvbuf_errors: u64,
+    sndbuf_errors: u64,
+    no_ports: u64,
+}
+
 #[derive(Default)]
 pub struct NetSample {
     pub iface: String,
-    pub rx_packets: Option<i64>,
-    pub rx_bytes: Option<i64>,
-    pub rx_errs: Option<i64>,
-    pub rx_drop: Option<i64>,
-    pub rx_fifo: Option<i64>,
-    pub tx_packets: Option<i64>,
-    pub tx_drop: Option<i64>,
-    pub softnet_processed: Option<i64>,
-    pub softnet_dropped: Option<i64>,
-    pub softnet_time_squeeze: Option<i64>,
-    pub softnet_top_cpus: Vec<(u32, u64)>, // top 3 by this-window squeeze delta
+    pub counters_reset: bool,
+    pub ring: RingDelta,
+    pub softnet: SoftnetDelta,
+    pub snmp_udp: SnmpUdpDelta,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct RingDelta {
+    pub rx_missed_errors: u64,
+    pub rx_dropped: u64,
+    pub rx_errors: u64,
+    pub rx_fifo_errors: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct SoftnetDelta {
+    pub processed: u64,
+    pub dropped: u64,
+    pub time_squeeze: u64,
+    pub time_squeeze_max_cpu: u64, // highest single-CPU delta this window
+    pub max_cpu_id: u32,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct SnmpUdpDelta {
+    pub in_datagrams: u64,
+    pub in_errors: u64,
+    pub rcvbuf_errors: u64,
+    pub sndbuf_errors: u64,
+    pub no_ports: u64,
 }
 
 impl NetTracker {
@@ -83,85 +113,93 @@ impl NetTracker {
             None => return None, // first tick: no delta yet
         };
 
-        let dev_delta = |cur: u64, prev: u64| -> Option<i64> {
-            if cur < prev {
-                None // wraparound: null this field, prev already replaced above
-            } else {
-                Some((cur - prev) as i64)
+        let reset = raw.ring.rx_missed_errors < prev.ring.rx_missed_errors
+            || raw.ring.rx_dropped < prev.ring.rx_dropped
+            || raw.ring.rx_errors < prev.ring.rx_errors
+            || raw.ring.rx_fifo_errors < prev.ring.rx_fifo_errors
+            || raw.softnet.processed < prev.softnet.processed
+            || raw.softnet.dropped < prev.softnet.dropped
+            || raw.softnet.time_squeeze < prev.softnet.time_squeeze
+            || raw.snmp_udp.in_datagrams < prev.snmp_udp.in_datagrams
+            || raw.snmp_udp.in_errors < prev.snmp_udp.in_errors
+            || raw.snmp_udp.rcvbuf_errors < prev.snmp_udp.rcvbuf_errors
+            || raw.snmp_udp.sndbuf_errors < prev.snmp_udp.sndbuf_errors
+            || raw.snmp_udp.no_ports < prev.snmp_udp.no_ports;
+        if reset {
+            return Some(NetSample {
+                iface: self.iface.clone(),
+                counters_reset: true,
+                ..Default::default()
+            });
+        }
+
+        let mut max_cpu_delta = 0u64;
+        let mut max_cpu_id = 0u32;
+        for (&cpu, &cur) in &raw.softnet.per_cpu_time_squeeze {
+            if let Some(&prev_v) = prev.softnet.per_cpu_time_squeeze.get(&cpu) {
+                let delta = cur.saturating_sub(prev_v);
+                if delta > max_cpu_delta {
+                    max_cpu_delta = delta;
+                    max_cpu_id = cpu;
+                }
             }
-        };
+        }
 
-        let mut sample = NetSample {
+        Some(NetSample {
             iface: self.iface.clone(),
-            rx_packets: dev_delta(raw.dev.rx_packets, prev.dev.rx_packets),
-            rx_bytes: dev_delta(raw.dev.rx_bytes, prev.dev.rx_bytes),
-            rx_errs: dev_delta(raw.dev.rx_errs, prev.dev.rx_errs),
-            rx_drop: dev_delta(raw.dev.rx_drop, prev.dev.rx_drop),
-            rx_fifo: dev_delta(raw.dev.rx_fifo, prev.dev.rx_fifo),
-            tx_packets: dev_delta(raw.dev.tx_packets, prev.dev.tx_packets),
-            tx_drop: dev_delta(raw.dev.tx_drop, prev.dev.tx_drop),
-            softnet_processed: dev_delta(raw.softnet.processed, prev.softnet.processed),
-            softnet_dropped: dev_delta(raw.softnet.dropped, prev.softnet.dropped),
-            softnet_time_squeeze: dev_delta(raw.softnet.time_squeeze, prev.softnet.time_squeeze),
-            softnet_top_cpus: Vec::new(),
-        };
-
-        // per-CPU squeeze delta: only for CPUs present in both readings
-        let mut per_cpu: Vec<(u32, u64)> = raw
-            .softnet
-            .per_cpu_squeeze
-            .iter()
-            .filter_map(|(&cpu, &cur)| {
-                let prev_v = *prev.softnet.per_cpu_squeeze.get(&cpu)?;
-                (cur >= prev_v).then_some((cpu, cur - prev_v))
-            })
-            .collect();
-        per_cpu.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        per_cpu.truncate(3);
-        sample.softnet_top_cpus = per_cpu;
-
-        Some(sample)
+            counters_reset: false,
+            ring: RingDelta {
+                rx_missed_errors: raw.ring.rx_missed_errors - prev.ring.rx_missed_errors,
+                rx_dropped: raw.ring.rx_dropped - prev.ring.rx_dropped,
+                rx_errors: raw.ring.rx_errors - prev.ring.rx_errors,
+                rx_fifo_errors: raw.ring.rx_fifo_errors - prev.ring.rx_fifo_errors,
+            },
+            softnet: SoftnetDelta {
+                processed: raw.softnet.processed - prev.softnet.processed,
+                dropped: raw.softnet.dropped - prev.softnet.dropped,
+                time_squeeze: raw.softnet.time_squeeze - prev.softnet.time_squeeze,
+                time_squeeze_max_cpu: max_cpu_delta,
+                max_cpu_id,
+            },
+            snmp_udp: SnmpUdpDelta {
+                in_datagrams: raw.snmp_udp.in_datagrams - prev.snmp_udp.in_datagrams,
+                in_errors: raw.snmp_udp.in_errors - prev.snmp_udp.in_errors,
+                rcvbuf_errors: raw.snmp_udp.rcvbuf_errors - prev.snmp_udp.rcvbuf_errors,
+                sndbuf_errors: raw.snmp_udp.sndbuf_errors - prev.snmp_udp.sndbuf_errors,
+                no_ports: raw.snmp_udp.no_ports - prev.snmp_udp.no_ports,
+            },
+        })
     }
 
     fn read_raw(&self) -> Result<Raw, String> {
         Ok(Raw {
-            dev: read_dev(&self.iface)?,
+            ring: read_ring(&self.iface)?,
             softnet: read_softnet()?,
+            snmp_udp: read_snmp_udp()?,
         })
     }
 }
 
-/// /proc/net/dev: "iface: rx_bytes rx_packets rx_errs rx_drop rx_fifo ... tx_bytes tx_packets tx_errs tx_drop ..."
-fn read_dev(iface: &str) -> Result<DevCounters, String> {
-    let text = fs::read_to_string("/proc/net/dev").map_err(|e| format!("/proc/net/dev: {e}"))?;
-    for line in text.lines() {
-        let Some((name, stats)) = line.split_once(':') else {
-            continue; // header lines have no ':'
-        };
-        if name.trim() != iface {
-            continue;
-        }
-        let f: Vec<u64> = stats
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if f.len() < 12 {
-            return Err(format!("{iface}: unexpected /proc/net/dev field count"));
-        }
-        return Ok(DevCounters {
-            rx_bytes: f[0],
-            rx_packets: f[1],
-            rx_errs: f[2],
-            rx_drop: f[3],
-            rx_fifo: f[4],
-            tx_packets: f[9],
-            tx_drop: f[11],
-        });
-    }
-    Err(format!("{iface}: not found in /proc/net/dev"))
+/// Layer 1: /sys/class/net/<iface>/statistics/* (NIC ring counters).
+fn read_ring(iface: &str) -> Result<RingCounters, String> {
+    let base = format!("/sys/class/net/{iface}/statistics");
+    let read_one = |name: &str| -> Result<u64, String> {
+        let path = format!("{base}/{name}");
+        fs::read_to_string(&path)
+            .map_err(|e| format!("{path}: {e}"))?
+            .trim()
+            .parse()
+            .map_err(|e| format!("{path}: bad value: {e}"))
+    };
+    Ok(RingCounters {
+        rx_missed_errors: read_one("rx_missed_errors")?,
+        rx_dropped: read_one("rx_dropped")?,
+        rx_errors: read_one("rx_errors")?,
+        rx_fifo_errors: read_one("rx_fifo_errors")?,
+    })
 }
 
-/// /proc/net/softnet_stat: one line per CPU, hex fields, no header.
+/// Layer 2: /proc/net/softnet_stat. One line per CPU, hex, no header.
 /// col 0 = processed, 1 = dropped, 2 = time_squeeze, last = cpu index (5.11+).
 fn read_softnet() -> Result<SoftnetCounters, String> {
     let text =
@@ -178,12 +216,60 @@ fn read_softnet() -> Result<SoftnetCounters, String> {
         out.processed += f[0];
         out.dropped += f[1];
         out.time_squeeze += f[2];
-        // prefer the explicit trailing CPU index (5.11+); fall back to line order
         let cpu = f.last().copied().unwrap_or(line_idx as u64) as u32;
-        out.per_cpu_squeeze.insert(cpu, f[2]);
+        out.per_cpu_time_squeeze.insert(cpu, f[2]);
     }
-    if out.per_cpu_squeeze.is_empty() {
+    if out.per_cpu_time_squeeze.is_empty() {
         return Err("softnet_stat: no parsable rows".into());
     }
     Ok(out)
+}
+
+/// Layer 3: /proc/net/snmp, "Udp:" section. Parsed by column name (from the
+/// header line) not position, since the column set has grown across kernels.
+fn read_snmp_udp() -> Result<SnmpUdpCounters, String> {
+    let text = fs::read_to_string("/proc/net/snmp").map_err(|e| format!("snmp: {e}"))?;
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if !line.starts_with("Udp:") {
+            continue;
+        }
+        let header: Vec<&str> = line.split_whitespace().skip(1).collect();
+        let values: Vec<&str> = lines
+            .next()
+            .ok_or("snmp: Udp header with no values line")?
+            .split_whitespace()
+            .skip(1)
+            .collect();
+        let get = |name: &str| -> u64 {
+            header
+                .iter()
+                .position(|&c| c == name)
+                .and_then(|i| values.get(i))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        return Ok(SnmpUdpCounters {
+            in_datagrams: get("InDatagrams"),
+            out_datagrams: get("OutDatagrams"),
+            in_errors: get("InErrors"),
+            rcvbuf_errors: get("RcvbufErrors"),
+            sndbuf_errors: get("SndbufErrors"),
+            no_ports: get("NoPorts"),
+        });
+    }
+    Err("snmp: no Udp: section found".into())
+}
+
+/// Primary interface, from the kernel's default route. Used when --iface isn't given.
+pub fn detect_iface() -> Result<String, String> {
+    let text = fs::read_to_string("/proc/net/route").map_err(|e| format!("route: {e}"))?;
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // col 0 = iface, col 1 = destination (hex); 00000000 = default route
+        if cols.len() > 1 && cols[1] == "00000000" {
+            return Ok(cols[0].to_string());
+        }
+    }
+    Err("no default route found; pass --iface explicitly".into())
 }
