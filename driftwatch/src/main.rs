@@ -68,27 +68,33 @@ enum Cmd {
         /// Emit JSON objects instead of human lines.
         #[arg(long)]
         json: bool,
-        /// Disk elevated: p99 this many times its baseline.
-        #[arg(long, default_value_t = 4)]
-        elevation_factor: u64,
-        /// Disk elevated: p99 above this floor, in microseconds.
+        /// disk_latency alert: p99 above this, in microseconds. Static, no baseline.
         #[arg(long, default_value_t = 1_500_000)]
-        p99_floor_us: u64,
-        /// Disk elevated: needs this many consecutive windows.
+        disk_latency_us: u64,
+        /// disk_latency alert: consecutive windows over threshold required. 1 = no suppression.
+        #[arg(long, default_value_t = 1)]
+        disk_streak: u32,
+        /// vote_lag alert: absolute slots behind tip.
+        #[arg(long, default_value_t = 4)]
+        vote_lag: i64,
+        /// freeze_in_last_n: how many trailing windows to count freezes over.
         #[arg(long, default_value_t = 3)]
-        streak: u32,
-        /// Lag elevated: slots over its own norm.
-        #[arg(long, default_value_t = 3)]
-        lag_delta: i64,
-        /// Freeze: wall-clock seconds of no slot advance before it counts.
-        #[arg(long, default_value_t = 6.0)]
-        freeze_min_secs: f64,
-        /// Freeze: a slot jump bigger than this is a discontinuity, not a freeze.
+        freeze_lookback: u32,
+        /// A slot jump bigger than this is a discontinuity, not a freeze.
         #[arg(long, default_value_t = 1000)]
         freeze_jump_bound: i64,
-        /// Network interface to read counters from.
-        #[arg(long, default_value = "ens3f0np0")]
-        net_iface: String,
+        /// ring_drop alert: rx_missed_errors delta above this.
+        #[arg(long, default_value_t = 0)]
+        ring_drop_threshold: u64,
+        /// napi_squeeze alert: time_squeeze delta above this. Tune from your own baseline.
+        #[arg(long, default_value_t = 100)]
+        napi_squeeze_threshold: u64,
+        /// udp_rcvbuf alert: RcvbufErrors delta above this.
+        #[arg(long, default_value_t = 0)]
+        udp_rcvbuf_threshold: u64,
+        /// Network interface to read counters from. Default: kernel's default-route interface.
+        #[arg(long)]
+        iface: Option<String>,
     },
 }
 
@@ -109,23 +115,33 @@ async fn main() -> Result<()> {
             vote,
             interval,
             json,
-            elevation_factor,
-            p99_floor_us,
-            streak,
-            lag_delta,
-            freeze_min_secs,
+            disk_latency_us,
+            disk_streak,
+            vote_lag,
+            freeze_lookback,
             freeze_jump_bound,
-            net_iface,
+            ring_drop_threshold,
+            napi_squeeze_threshold,
+            udp_rcvbuf_threshold,
+            iface,
         } => {
             let thresholds = correlate::Thresholds {
-                elevation_factor,
-                p99_floor_ns: p99_floor_us * 1_000,
-                streak,
-                lag_delta,
-                freeze_min_secs,
+                disk_latency_ns: disk_latency_us * 1_000,
+                disk_streak,
+                vote_lag,
+                freeze_lookback,
                 freeze_jump_bound,
+                ring_drop_threshold,
+                napi_squeeze_threshold,
+                udp_rcvbuf_threshold,
             };
-            let net = net::NetTracker::new(net_iface);
+            let iface = match iface {
+                Some(i) => i,
+                None => net::detect_iface()
+                    .map_err(|e| anyhow::anyhow!("--iface not given and auto-detect failed: {e}"))?,
+            };
+            eprintln!("driftwatch: using interface {iface}");
+            let net = net::NetTracker::new(iface);
             run(dev, window, rpc, vote, interval, json, thresholds, net).await
         }
     }
