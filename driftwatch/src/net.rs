@@ -8,12 +8,18 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+const XDP_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub struct NetTracker {
     iface: String,
     prev: Option<Raw>,
     last_err: Option<String>,
     parse_errors: u64, // cumulative count of failed reads since start
+    xdp_cache: Option<bool>,
+    xdp_checked_at: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -91,7 +97,24 @@ impl NetTracker {
             prev: None,
             last_err: None,
             parse_errors: 0,
+            xdp_cache: None,
+            xdp_checked_at: None,
         }
+    }
+
+    /// XDP attach state, shelled out to `ip -d link show` since the kernel
+    /// doesn't expose this via sysfs. Cached: attach/detach isn't a
+    /// per-window event, and spawning a process every window isn't free.
+    fn is_xdp(&mut self) -> Option<bool> {
+        let stale = self
+            .xdp_checked_at
+            .map(|t| t.elapsed() > XDP_CACHE_TTL)
+            .unwrap_or(true);
+        if stale {
+            self.xdp_cache = detect_is_xdp(&self.iface);
+            self.xdp_checked_at = Some(Instant::now());
+        }
+        self.xdp_cache
     }
 
     /// Cumulative count of failed reads since start, regardless of which window.
@@ -136,7 +159,7 @@ impl NetTracker {
         if reset {
             return Some(NetSample {
                 iface: self.iface.clone(),
-                is_xdp: detect_is_xdp(&self.iface),
+                is_xdp: self.is_xdp(),
                 counters_reset: true,
                 ..Default::default()
             });
@@ -156,7 +179,7 @@ impl NetTracker {
 
         Some(NetSample {
             iface: self.iface.clone(),
-            is_xdp: detect_is_xdp(&self.iface),
+            is_xdp: self.is_xdp(),
             counters_reset: false,
             ring: RingDelta {
                 rx_missed_errors: raw.ring.rx_missed_errors - prev.ring.rx_missed_errors,
@@ -270,12 +293,16 @@ fn read_snmp_udp() -> Result<SnmpUdpCounters, String> {
     Err("snmp: no Udp: section found".into())
 }
 
-/// Is an XDP program attached to this interface right now. None if the
-/// kernel doesn't expose the file (older kernel or driver).
+/// Is an XDP program attached to this interface right now. There's no
+/// sysfs file for this; `ip -d link show` prints a "prog/xdp id N ..."
+/// line only when a program is attached. None if `ip` itself fails
+/// (missing binary, no permission).
 fn detect_is_xdp(iface: &str) -> Option<bool> {
-    let path = format!("/sys/class/net/{iface}/xdp/prog_id");
-    let id = fs::read_to_string(path).ok()?;
-    Some(id.trim() != "0" && !id.trim().is_empty())
+    let out = Command::new("ip").args(["-d", "link", "show", iface]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).contains("prog/xdp"))
 }
 
 /// Every path `--check` should verify is readable before a real run.
