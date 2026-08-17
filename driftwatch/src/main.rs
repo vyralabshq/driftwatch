@@ -95,6 +95,15 @@ enum Cmd {
         /// Network interface to read counters from. Default: kernel's default-route interface.
         #[arg(long)]
         iface: Option<String>,
+        /// Emit exactly one window then exit, instead of running forever.
+        #[arg(long)]
+        dry_run: bool,
+        /// Check eBPF load, network paths, and RPC reachability, print pass/fail, exit.
+        #[arg(long)]
+        check: bool,
+        /// Attach driftwatch's own CPU time (user+sys) per window to the output.
+        #[arg(long)]
+        self_metrics: bool,
     },
 }
 
@@ -124,6 +133,9 @@ async fn main() -> Result<()> {
             napi_squeeze_threshold,
             udp_rcvbuf_threshold,
             iface,
+            dry_run,
+            check,
+            self_metrics,
         } => {
             let thresholds = correlate::Thresholds {
                 disk_latency_ns: disk_latency_us * 1_000,
@@ -140,10 +152,86 @@ async fn main() -> Result<()> {
                 None => net::detect_iface()
                     .map_err(|e| anyhow::anyhow!("--iface not given and auto-detect failed: {e}"))?,
             };
+
+            if check {
+                return run_check(&dev, &rpc, vote, &iface).await;
+            }
+
             eprintln!("driftwatch: using interface {iface}");
+            log_active_layers(&iface, dry_run, self_metrics);
             let net = net::NetTracker::new(iface);
-            run(dev, window, rpc, vote, interval, json, thresholds, net).await
+            run(
+                dev,
+                window,
+                rpc,
+                vote,
+                interval,
+                json,
+                thresholds,
+                net,
+                dry_run,
+                self_metrics,
+            )
+            .await
         }
+    }
+}
+
+/// Summarizes which layers are active vs skipped, and why, before the main loop starts.
+fn log_active_layers(iface: &str, dry_run: bool, self_metrics: bool) {
+    eprintln!("driftwatch: layers active:");
+    eprintln!("  disk (eBPF block tracepoints): active");
+    eprintln!("  rpc (vote lag / slot freeze): active");
+    eprintln!("  net layer 1-3 (ring/softnet/snmp, iface {iface}): active");
+    eprintln!("  net layer 4 (per-socket agave attribution): skipped, not implemented (P1)");
+    eprintln!(
+        "  self_metrics (own CPU time): {}",
+        if self_metrics { "active" } else { "skipped, --self-metrics not passed" }
+    );
+    if dry_run {
+        eprintln!("  dry_run: exiting after one window");
+    }
+}
+
+/// Validates eBPF load, network paths, and RPC reachability without entering the main loop.
+async fn run_check(dev: &Option<String>, rpc_url: &str, vote: Option<String>, iface: &str) -> Result<()> {
+    let mut ok = true;
+
+    match load_profiler(dev) {
+        Ok(_profiler) => println!("[ok]   eBPF load + attach (block_rq_issue, block_rq_complete)"),
+        Err(e) => {
+            println!("[FAIL] eBPF load + attach: {e}");
+            ok = false;
+        }
+    }
+
+    for path in net::check_paths(iface) {
+        match std::fs::read_to_string(&path) {
+            Ok(_) => println!("[ok]   net path readable: {path}"),
+            Err(e) => {
+                println!("[FAIL] net path readable: {path}: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    let mut poller = rpc::RpcPoller::new(rpc_url);
+    if let Some(pk) = vote {
+        poller = poller.with_vote_pubkey(pk);
+    }
+    match poller.sample().await {
+        rpc::Sample::Up(_) => println!("[ok]   rpc reachable: {rpc_url}"),
+        rpc::Sample::Down { reason } => {
+            println!("[FAIL] rpc reachable: {rpc_url}: {reason}");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!("\ncheck passed");
+        Ok(())
+    } else {
+        anyhow::bail!("check failed, see [FAIL] lines above");
     }
 }
 
@@ -278,6 +366,8 @@ async fn run(
     json: bool,
     thresholds: correlate::Thresholds,
     net: net::NetTracker,
+    dry_run: bool,
+    self_metrics: bool,
 ) -> Result<()> {
     let (_ebpf, events, drops) = load_profiler(&dev)?;
     tokio::spawn(disk::watch_drops(drops));
@@ -300,7 +390,7 @@ async fn run(
 
     tokio::select! {
         res = disk::consume(events, window, false, disk_tx) => res,
-        _ = correlate::combine(disk_rx, rpc_rx, json, thresholds, net) => Ok(()),
+        _ = correlate::combine(disk_rx, rpc_rx, json, thresholds, net, dry_run, self_metrics) => Ok(()),
         _ = signal::ctrl_c() => {
             if !json {
                 println!("\nstopping.");
