@@ -18,6 +18,7 @@ use crate::{
     net::{NetSample, NetTracker},
     output,
     rpc::{Sample, ValidatorSample},
+    sockets::SocketSample,
 };
 
 const HISTORY: usize = 20; // depth of the informational disk-median window
@@ -33,6 +34,7 @@ pub struct Thresholds {
     pub ring_drop_threshold: u64,    // rx_missed_errors delta
     pub napi_squeeze_threshold: u64, // time_squeeze delta
     pub udp_rcvbuf_threshold: u64,   // RcvbufErrors delta
+    pub socket_drop_threshold: u64,  // any single agave socket's drops delta
 }
 
 /// One output per disk window, carrying the latest validator sample.
@@ -41,6 +43,7 @@ pub struct Thresholds {
 pub async fn combine(
     mut disk_rx: Receiver<WindowStats>,
     mut rpc_rx: Receiver<Sample>,
+    mut socket_rx: Receiver<SocketSample>,
     json_mode: bool,
     thresholds: Thresholds,
     mut net: NetTracker,
@@ -49,6 +52,7 @@ pub async fn combine(
 ) {
     let started = Instant::now();
     let mut latest: Option<Sample> = None;
+    let mut latest_sockets: Option<SocketSample> = None;
     let mut engine = AlertEngine::new(thresholds);
     let mut cpu = self_metrics.then(SelfCpu::new);
     loop {
@@ -57,15 +61,19 @@ pub async fn combine(
                 Some(s) => latest = Some(s),
                 None => return,
             },
+            s = socket_rx.recv() => match s {
+                Some(s) => latest_sockets = Some(s),
+                None => return,
+            },
             w = disk_rx.recv() => match w {
                 Some(w) => {
                     let disk = engine.observe_disk(&w);
                     let vote_lag_alert = engine.observe_lag(latest.as_ref());
                     let freeze = engine.observe_slot(latest.as_ref());
                     let net_sample = net.sample();
-                    let alerts = build_alerts(&disk, vote_lag_alert, &freeze, &net_sample, &thresholds);
+                    let alerts = build_alerts(&disk, vote_lag_alert, &freeze, &net_sample, latest_sockets.as_ref(), &thresholds);
                     let self_cpu_ms = cpu.as_mut().map(|c| c.delta_ms());
-                    emit(&w, latest.as_ref(), json_mode, started, &disk, &freeze, &alerts, &net_sample, net.parse_errors(), self_cpu_ms);
+                    emit(&w, latest.as_ref(), json_mode, started, &disk, &freeze, &alerts, &net_sample, net.parse_errors(), self_cpu_ms, latest_sockets.as_ref());
                     if dry_run {
                         return;
                     }
@@ -265,12 +273,14 @@ impl SlotTracker {
 
 /// Independent alerts only. disk_latency/vote_lag/slot_freeze from the disk
 /// window and validator sample; ring_drop/napi_squeeze/udp_rcvbuf from the
-/// network layers (layers 1-3). socket_drop needs layer 4 (P1), never fires yet.
+/// network layers (layers 1-3); socket_drop from layer 4, any single
+/// agave-owned socket over threshold.
 fn build_alerts(
     disk: &DiskResult,
     vote_lag_alert: bool,
     freeze: &FreezeState,
     net: &Option<NetSample>,
+    sockets: Option<&SocketSample>,
     t: &Thresholds,
 ) -> Vec<&'static str> {
     let mut a = Vec::new();
@@ -292,6 +302,11 @@ fn build_alerts(
         }
         if n.snmp_udp.rcvbuf_errors > t.udp_rcvbuf_threshold {
             a.push("udp_rcvbuf");
+        }
+    }
+    if let Some(s) = sockets {
+        if s.sockets.iter().any(|sock| sock.drops > t.socket_drop_threshold) {
+            a.push("socket_drop");
         }
     }
     a
@@ -325,9 +340,10 @@ fn emit(
     net: &Option<NetSample>,
     net_parse_errors: u64,
     self_cpu_ms: Option<u64>,
+    sockets: Option<&SocketSample>,
 ) {
     if json_mode {
-        println!("{}", to_json(w, v, disk, freeze, alerts, net, net_parse_errors, self_cpu_ms));
+        println!("{}", to_json(w, v, disk, freeze, alerts, net, net_parse_errors, self_cpu_ms, sockets));
     } else {
         let val = match v {
             Some(s) => output::compact(s),
@@ -357,12 +373,30 @@ fn to_json(
     net: &Option<NetSample>,
     net_parse_errors: u64,
     self_cpu_ms: Option<u64>,
+    sockets: Option<&SocketSample>,
 ) -> String {
     let validator = match v {
         Some(Sample::Up(s)) => up_json(s),
         Some(Sample::Down { reason }) => json!({ "state": "down", "reason": reason }),
         None => serde_json::Value::Null,
     };
+    let sockets_json: Vec<_> = sockets
+        .map(|s| {
+            s.sockets
+                .iter()
+                .map(|sock| {
+                    json!({
+                        "port": sock.port,
+                        "role": sock.role,
+                        "drops": sock.drops,
+                        "rx_queue": sock.rx_queue,
+                        "tx_queue": sock.tx_queue,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let agave_pid = sockets.and_then(|s| s.pid);
     let net_json = match net {
         Some(n) => json!({
             "iface": &n.iface,
@@ -387,7 +421,8 @@ fn to_json(
                 "sndbuf_errors": n.snmp_udp.sndbuf_errors,
                 "no_ports": n.snmp_udp.no_ports,
             },
-            "sockets": [], // layer 4, P1: always empty for now
+            "sockets": sockets_json,
+            "agave_pid": agave_pid,
             "counters_reset": n.counters_reset,
             "parse_errors": net_parse_errors,
         }),
