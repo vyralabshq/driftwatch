@@ -13,6 +13,7 @@ pub struct NetTracker {
     iface: String,
     prev: Option<Raw>,
     last_err: Option<String>,
+    parse_errors: u64, // cumulative count of failed reads since start
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +51,7 @@ struct SnmpUdpCounters {
 #[derive(Default)]
 pub struct NetSample {
     pub iface: String,
+    pub is_xdp: Option<bool>,
     pub counters_reset: bool,
     pub ring: RingDelta,
     pub softnet: SoftnetDelta,
@@ -88,7 +90,13 @@ impl NetTracker {
             iface,
             prev: None,
             last_err: None,
+            parse_errors: 0,
         }
+    }
+
+    /// Cumulative count of failed reads since start, regardless of which window.
+    pub fn parse_errors(&self) -> u64 {
+        self.parse_errors
     }
 
     /// One window's sample. Never panics: any failure logs once and returns None.
@@ -99,6 +107,7 @@ impl NetTracker {
                 r
             }
             Err(e) => {
+                self.parse_errors += 1;
                 if self.last_err.as_deref() != Some(&e) {
                     eprintln!("WARN: net read failed: {e}");
                     self.last_err = Some(e);
@@ -127,6 +136,7 @@ impl NetTracker {
         if reset {
             return Some(NetSample {
                 iface: self.iface.clone(),
+                is_xdp: detect_is_xdp(&self.iface),
                 counters_reset: true,
                 ..Default::default()
             });
@@ -146,6 +156,7 @@ impl NetTracker {
 
         Some(NetSample {
             iface: self.iface.clone(),
+            is_xdp: detect_is_xdp(&self.iface),
             counters_reset: false,
             ring: RingDelta {
                 rx_missed_errors: raw.ring.rx_missed_errors - prev.ring.rx_missed_errors,
@@ -257,6 +268,28 @@ fn read_snmp_udp() -> Result<SnmpUdpCounters, String> {
         });
     }
     Err("snmp: no Udp: section found".into())
+}
+
+/// Is an XDP program attached to this interface right now. None if the
+/// kernel doesn't expose the file (older kernel or driver).
+fn detect_is_xdp(iface: &str) -> Option<bool> {
+    let path = format!("/sys/class/net/{iface}/xdp/prog_id");
+    let id = fs::read_to_string(path).ok()?;
+    Some(id.trim() != "0" && !id.trim().is_empty())
+}
+
+/// Every path `--check` should verify is readable before a real run.
+pub fn check_paths(iface: &str) -> Vec<String> {
+    let mut paths = vec![
+        format!("/sys/class/net/{iface}/statistics/rx_missed_errors"),
+        format!("/sys/class/net/{iface}/statistics/rx_dropped"),
+        format!("/sys/class/net/{iface}/statistics/rx_errors"),
+        format!("/sys/class/net/{iface}/statistics/rx_fifo_errors"),
+        "/proc/net/softnet_stat".to_string(),
+        "/proc/net/snmp".to_string(),
+    ];
+    paths.sort();
+    paths
 }
 
 /// Primary interface, from the kernel's default route. Used when --iface isn't given.
