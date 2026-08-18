@@ -47,7 +47,7 @@ pub struct SocketTracker {
     pid: Option<u32>,
     fd_inodes: HashSet<u64>,
     port_roles: HashMap<u16, String>,
-    prev_drops: HashMap<u64, u64>, // inode -> last cumulative drops seen
+    prev_drops: HashMap<u64, u64>, // socket inode mapped to its last cumulative drops seen
     fd_refresh_interval: Duration,
     last_fd_refresh: Option<Instant>,
     ledger: Option<String>, // needed to reach the admin socket for contact-info
@@ -69,9 +69,10 @@ impl SocketTracker {
         }
     }
 
-    /// Rebuilds pid, fd->inode set, and port->role map. Cheap parts always
-    /// run; the admin-socket role lookup only on the slow timer or when
-    /// the pid changed (a validator restart makes old roles suspect).
+    /// Rebuilds the pid, the fd to inode set, and the port to role map.
+    /// Cheap parts always run; the admin socket role lookup only runs on
+    /// the slow timer or when the pid changed, since a validator restart
+    /// makes old roles suspect.
     async fn refresh(&mut self) {
         let found = resolve_pid(self.pid_override);
         let pid_changed = found != self.pid;

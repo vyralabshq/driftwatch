@@ -111,7 +111,8 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         fd_refresh: u64,
         /// Seconds between layer-4 socket samples. Decoupled from --window since
-        /// the fd walk + proc scan + RPC role lookup are heavier than layers 1-3.
+        /// the fd walk, proc scan, and admin socket role lookup are all heavier
+        /// than layers 1-3.
         #[arg(long, default_value_t = 5)]
         socket_interval: u64,
         /// Emit exactly one window then exit, instead of running forever.

@@ -9,8 +9,9 @@ use aya::maps::{MapData, PerCpuArray, RingBuf};
 use driftwatch_common::{DiskEvent, RW_READ, RW_WRITE};
 use tokio::{io::unix::AsyncFd, sync::mpsc::Sender};
 
-/// Two wake sources: kernel when "data ready" -> drain into the window;
-/// ticker fires to finish the window, send its stats, and start fresh.
+/// Two wake sources: the kernel says data is ready, so drain it into the
+/// window, or the ticker fires, so finish the window, send its stats,
+/// and start fresh.
 pub async fn consume(
     ring: RingBuf<MapData>,
     window_secs: u64,
@@ -41,7 +42,7 @@ pub async fn consume(
             _ = ticker.tick() => {
                 let stats = std::mem::take(&mut window).finish(window_secs);
                 if tx.send(stats).await.is_err() {
-                    return Ok(()); // receiver gone -> we're shutting down
+                    return Ok(()); // receiver gone, we're shutting down
                 }
             }
         }

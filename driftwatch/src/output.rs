@@ -53,7 +53,7 @@ fn up_line(s: &ValidatorSample) -> String {
     )
 }
 
-/// 1234567 -> "1,234,567"
+/// Turns 1234567 into "1,234,567".
 fn commas(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();

@@ -10,7 +10,7 @@ pub async fn poll_stream(mut poller: RpcPoller, interval_secs: u64, tx: Sender<S
     loop {
         ticker.tick().await;
         if tx.send(poller.sample().await).await.is_err() {
-            return; // receiver gone -> shutting down
+            return; // receiver gone, shutting down
         }
     }
 }
