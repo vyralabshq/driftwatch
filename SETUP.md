@@ -149,14 +149,9 @@ One object per window:
       "no_ports": 0
     },
     "sockets": [
-      {
-        "port": 8000,
-        "role": "gossip",
-        "drops": 0,
-        "rx_queue": 0,
-        "tx_queue": 0
-      },
-      { "port": 8001, "role": "tvu", "drops": 0, "rx_queue": 0, "tx_queue": 0 }
+      { "port": 8000, "role": "gossip", "count": 1, "drops": 0, "rx_queue": 0, "tx_queue": 0 },
+      { "port": 8001, "role": "tvu", "count": 1, "drops": 0, "rx_queue": 0, "tx_queue": 0 },
+      { "port": 8006, "role": "unknown", "count": 12, "drops": 0, "rx_queue": 0, "tx_queue": 0 }
     ],
     "agave_pid": 2819333,
     "ethtool": {},
@@ -168,3 +163,9 @@ One object per window:
 
 `baseline.disk_p99_median_us` is informational only, it never decides an alert.
 `alerts` lists whichever of the alert names fired that window, empty if none did.
+Each socket's `count` is how many sockets share that port. Agave uses SO_REUSEPORT
+for parallelism on its busiest sockets, shred ingest especially, so one port can be
+many sockets, grouped into one entry with summed drops and queue depth. Roles come
+from `agave-validator contact-info`, which does not name every socket a validator
+opens, so some ports show `role: "unknown"`. That is agave not exposing the name,
+not a driftwatch gap.

@@ -25,9 +25,19 @@ pub struct SocketSample {
 pub struct SocketEntry {
     pub port: u16,
     pub role: String,
-    pub drops: u64, // delta since last sample, not cumulative
-    pub rx_queue: u64,
-    pub tx_queue: u64,
+    pub count: u32, // how many sockets share this port, agave uses SO_REUSEPORT for parallelism
+    pub drops: u64, // summed across the group, delta since last sample, not cumulative
+    pub rx_queue: u64, // summed across the group
+    pub tx_queue: u64, // summed across the group
+}
+
+/// Accumulator for one port while grouping raw sockets that share it.
+struct SocketGroup {
+    role: String,
+    count: u32,
+    drops: u64,
+    rx_queue: u64,
+    tx_queue: u64,
 }
 
 /// Poll forever on its own interval, sending each SocketSample down the channel.
@@ -132,7 +142,10 @@ impl SocketTracker {
             raw.extend(v6);
         }
 
-        let mut sockets = Vec::new();
+        // agave binds many sockets to the same port with SO_REUSEPORT for
+        // parallelism, shred ingest especially. Grouped by port so the output
+        // shows one line per port with a count, not a dozen near-identical rows.
+        let mut grouped: HashMap<u16, SocketGroup> = HashMap::new();
         for s in raw {
             // race: fd closed between the walk and this read, or not agave's
             if !self.fd_inodes.contains(&s.inode) {
@@ -144,14 +157,31 @@ impl SocketTracker {
                 .get(&s.port)
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
-            sockets.push(SocketEntry {
-                port: s.port,
+            let group = grouped.entry(s.port).or_insert(SocketGroup {
                 role,
-                drops: s.drops.saturating_sub(prev),
-                rx_queue: s.rx_queue,
-                tx_queue: s.tx_queue,
+                count: 0,
+                drops: 0,
+                rx_queue: 0,
+                tx_queue: 0,
             });
+            group.count += 1;
+            group.drops += s.drops.saturating_sub(prev);
+            group.rx_queue += s.rx_queue;
+            group.tx_queue += s.tx_queue;
         }
+
+        let mut sockets: Vec<SocketEntry> = grouped
+            .into_iter()
+            .map(|(port, g)| SocketEntry {
+                port,
+                role: g.role,
+                count: g.count,
+                drops: g.drops,
+                rx_queue: g.rx_queue,
+                tx_queue: g.tx_queue,
+            })
+            .collect();
+        sockets.sort_unstable_by_key(|s| s.port);
 
         SocketSample {
             pid: Some(pid),

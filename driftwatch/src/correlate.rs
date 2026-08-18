@@ -387,6 +387,7 @@ fn to_json(
                     json!({
                         "port": sock.port,
                         "role": sock.role,
+                        "count": sock.count,
                         "drops": sock.drops,
                         "rx_queue": sock.rx_queue,
                         "tx_queue": sock.tx_queue,
