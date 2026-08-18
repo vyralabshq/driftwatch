@@ -15,23 +15,21 @@ Anyone can run this on their own validator. See [SETUP.md](SETUP.md) to get star
 - Disk latency, from the kernel, using eBPF
 - Vote lag, credits, and health, from the validator's RPC
 - Network drops: NIC ring, NAPI, UDP buffers
-- Which agave socket is dropping packets (gossip, tvu, tpu, and so on)
 
-All four on one clock. One line, or one JSON object, per window.
+All three on one clock. One line, or one JSON object, per window.
 
 ## Alerts
 
 Each alert checks its own thing. No alert waits on another one to also fire.
 
-| alert          | fires when                                 |
-| -------------- | ------------------------------------------ |
-| `disk_latency` | disk p99 too high for too long             |
-| `vote_lag`     | validator falling behind the network       |
-| `slot_freeze`  | slot stops moving                          |
-| `ring_drop`    | NIC dropping packets                       |
-| `napi_squeeze` | CPU can't keep up with packets             |
-| `udp_rcvbuf`   | UDP receive buffer overflowing             |
-| `socket_drop`  | one specific agave socket dropping packets |
+| alert          | fires when                           |
+| -------------- | ------------------------------------- |
+| `disk_latency` | disk p99 too high for too long        |
+| `vote_lag`     | validator falling behind the network  |
+| `slot_freeze`  | slot stops moving                     |
+| `ring_drop`    | NIC dropping packets                  |
+| `napi_squeeze` | CPU can't keep up with packets        |
+| `udp_rcvbuf`   | UDP receive buffer overflowing        |
 
 Flags to tune these: [SETUP.md](SETUP.md).
 

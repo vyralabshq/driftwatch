@@ -61,7 +61,7 @@ impl RpcPoller {
     }
 
     /// One JSON-RPC round trip; returns the `result` field.
-    pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let resp: Value = self
             .client

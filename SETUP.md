@@ -35,32 +35,26 @@ lsblk -o NAME,MAJ:MIN        # major:minor of the parent disk, not the partition
 Check everything works before running for real:
 
 ```shell
-driftwatch run --dev 253:16 --ledger /path/to/ledger --check
+driftwatch run --dev 253:16 --check
 ```
 
 ## Flags
 
-| flag                  | what it does                                              | default                 |
-| --------------------- | --------------------------------------------------------- | ----------------------- |
-| `--dev <major:minor>` | disk to watch                                             | all disks               |
-| `--window <secs>`     | window size                                               | 3                       |
-| `--rpc <url>`         | validator RPC endpoint                                    | `http://127.0.0.1:8899` |
-| `--vote <pubkey>`     | vote account                                              | auto                    |
-| `--interval <secs>`   | seconds between RPC polls                                 | 2                       |
-| `--json`              | JSON output                                               | off                     |
-| `--iface <name>`      | network interface                                         | auto                    |
-| `--pid <pid>`         | agave process PID                                         | auto                    |
-| `--ledger <path>`     | needed for socket role names, else they show as `unknown` | none                    |
-| `--check`             | test the setup, don't run                                 | off                     |
-| `--dry-run`           | one window then exit                                      | off                     |
-| `--self-metrics`      | show driftwatch's own CPU cost                            | off                     |
+| flag                  | what it does                    | default                 |
+| --------------------- | -------------------------------- | ----------------------- |
+| `--dev <major:minor>` | disk to watch                   | all disks               |
+| `--window <secs>`     | window size                     | 3                       |
+| `--rpc <url>`         | validator RPC endpoint          | `http://127.0.0.1:8899` |
+| `--vote <pubkey>`     | vote account                    | auto                    |
+| `--interval <secs>`   | seconds between RPC polls       | 2                       |
+| `--json`              | JSON output                     | off                     |
+| `--iface <name>`      | network interface               | auto                    |
+| `--check`             | test the setup, don't run       | off                     |
+| `--dry-run`           | one window then exit            | off                     |
+| `--self-metrics`      | show driftwatch's own CPU cost  | off                     |
 
 Each alert also has its own threshold flag, e.g. `--vote-lag`, `--disk-latency-us`,
 `--ring-drop-threshold`. Defaults are sane; tune them once you know your box's baseline.
-
-`--fd-refresh <secs>` (default 30) and `--socket-interval <secs>` (default 5) tune how
-often layer 4 rebuilds its socket map and samples, separately from `--window`, since
-that work is heavier than the rest.
 
 ## Running as a service
 
@@ -75,7 +69,6 @@ User=root
 ExecStart=/path/to/driftwatch run \
   --dev 259:0 \
   --rpc http://127.0.0.1:8899 \
-  --ledger /path/to/ledger \
   --json
 Restart=on-failure
 RestartSec=5
@@ -148,13 +141,6 @@ One object per window:
       "sndbuf_errors": 0,
       "no_ports": 0
     },
-    "sockets": [
-      { "port": 8000, "role": "gossip", "count": 1, "drops": 0, "rx_queue": 0, "tx_queue": 0 },
-      { "port": 8001, "role": "tvu", "count": 1, "drops": 0, "rx_queue": 0, "tx_queue": 0 },
-      { "port": 8006, "role": "unknown", "count": 12, "drops": 0, "rx_queue": 0, "tx_queue": 0 }
-    ],
-    "agave_pid": 2819333,
-    "ethtool": {},
     "counters_reset": false,
     "parse_errors": 0
   }
@@ -163,9 +149,3 @@ One object per window:
 
 `baseline.disk_p99_median_us` is informational only, it never decides an alert.
 `alerts` lists whichever of the alert names fired that window, empty if none did.
-Each socket's `count` is how many sockets share that port. Agave uses SO_REUSEPORT
-for parallelism on its busiest sockets, shred ingest especially, so one port can be
-many sockets, grouped into one entry with summed drops and queue depth. Roles come
-from `agave-validator contact-info`, which does not name every socket a validator
-opens, so some ports show `role: "unknown"`. That is agave not exposing the name,
-not a driftwatch gap.
