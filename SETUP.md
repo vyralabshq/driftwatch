@@ -93,27 +93,27 @@ One object per window:
   "self_cpu_ms": null,
   "disk": {
     "window_secs": 3,
-    "reqs": 511,
-    "writes": 250,
-    "reads": 261,
+    "reqs": 63,
+    "writes": 59,
+    "reads": 4,
     "others": 0,
-    "bytes": 29028352,
+    "bytes": 15110144,
     "errors": 0,
-    "p50_us": 320,
-    "p99_us": 17574,
-    "max_us": 17896
+    "p50_us": 569,
+    "p99_us": 16295,
+    "max_us": 16295
   },
   "validator": {
     "state": "ok",
     "epoch": 1009,
-    "slot": 430579083,
-    "last_vote": 430579081,
+    "slot": 430668511,
+    "last_vote": 430668509,
     "vote_lag": 2,
-    "credits": 3378181,
+    "credits": 4777489,
     "delinquent": false,
     "healthy": true
   },
-  "baseline": { "disk_p99_median_us": 111 },
+  "baseline": { "disk_p99_median_us": 341836 },
   "freeze": false,
   "freeze_duration_ms": 0,
   "freeze_in_last_n": 0,
@@ -128,14 +128,14 @@ One object per window:
       "rx_fifo_errors": 0
     },
     "softnet": {
-      "processed": 42187,
+      "processed": 39229,
       "dropped": 0,
       "time_squeeze": 0,
       "time_squeeze_max_cpu": 0,
       "max_cpu_id": 0
     },
     "snmp_udp": {
-      "in_datagrams": 42143,
+      "in_datagrams": 38895,
       "in_errors": 0,
       "rcvbuf_errors": 0,
       "sndbuf_errors": 0,
@@ -147,5 +147,6 @@ One object per window:
 }
 ```
 
-`baseline.disk_p99_median_us` is informational only, it never decides an alert.
-`alerts` lists whichever of the alert names fired that window, empty if none did.
+Real capture, straight off the production box. `baseline.disk_p99_median_us` is
+informational only, it never decides an alert. `alerts` lists whichever of the
+alert names fired that window, empty if none did.
