@@ -4,17 +4,15 @@
 // being indistinguishable.
 //
 // Runs on its own timer (--socket-interval), decoupled from the disk
-// window: the fd walk, /proc/net/udp scan, and RPC role lookup are all
-// heavier than layers 1-3 and don't need to run every window.
+// window: the fd walk, /proc/net/udp scan, and admin-socket role lookup
+// are all heavier than layers 1-3 and don't need to run every window.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
 use tokio::sync::mpsc::Sender;
-
-use crate::rpc::RpcPoller;
 
 /// One tick's worth of layer-4 signal. Empty sockets + no pid means agave
 /// wasn't found this refresh, not that nothing is happening.
@@ -51,12 +49,12 @@ pub struct SocketTracker {
     prev_drops: HashMap<u64, u64>, // inode -> last cumulative drops seen
     fd_refresh_interval: Duration,
     last_fd_refresh: Option<Instant>,
-    rpc: RpcPoller, // used only for getIdentity / getClusterNodes
+    ledger: Option<String>, // needed to reach the admin socket for contact-info
     last_err: Option<String>,
 }
 
 impl SocketTracker {
-    pub fn new(rpc_url: String, pid_override: Option<u32>, fd_refresh_secs: u64) -> Self {
+    pub fn new(pid_override: Option<u32>, fd_refresh_secs: u64, ledger: Option<String>) -> Self {
         Self {
             pid_override,
             pid: None,
@@ -65,14 +63,14 @@ impl SocketTracker {
             prev_drops: HashMap::new(),
             fd_refresh_interval: Duration::from_secs(fd_refresh_secs.max(1)),
             last_fd_refresh: None,
-            rpc: RpcPoller::new(rpc_url),
+            ledger,
             last_err: None,
         }
     }
 
     /// Rebuilds pid, fd->inode set, and port->role map. Cheap parts always
-    /// run; expensive parts (RPC role lookup) only on the slow timer or
-    /// when the pid changed (a validator restart makes old roles suspect).
+    /// run; the admin-socket role lookup only on the slow timer or when
+    /// the pid changed (a validator restart makes old roles suspect).
     async fn refresh(&mut self) {
         let found = resolve_pid(self.pid_override);
         let pid_changed = found != self.pid;
@@ -87,16 +85,18 @@ impl SocketTracker {
             None => HashSet::new(),
         };
 
-        match refresh_port_roles(&self.rpc).await {
-            Ok(roles) => {
-                self.port_roles = roles;
-                self.last_err = None;
-            }
-            Err(e) => {
-                // keep the last known roles rather than blanking a working map
-                if self.last_err.as_deref() != Some(&e) {
-                    eprintln!("WARN: socket role discovery failed: {e}");
-                    self.last_err = Some(e);
+        if let Some(ledger) = &self.ledger {
+            match refresh_port_roles(ledger) {
+                Ok(roles) => {
+                    self.port_roles = roles;
+                    self.last_err = None;
+                }
+                Err(e) => {
+                    // keep the last known roles rather than blanking a working map
+                    if self.last_err.as_deref() != Some(&e) {
+                        eprintln!("WARN: socket role discovery failed: {e}");
+                        self.last_err = Some(e);
+                    }
                 }
             }
         }
@@ -250,59 +250,70 @@ fn parse_proc_net_udp(path: &str) -> Result<Vec<RawUdpSocket>, String> {
     Ok(out)
 }
 
-/// getIdentity for our own pubkey, then getClusterNodes to find our own
-/// ContactInfo entry, then every string field shaped like "ip:port" becomes
-/// a port->role entry. Reading the schema generically instead of a fixed
-/// field list means new fields (tpu_quic, tvu_quic, ...) get picked up
-/// automatically as agave versions add them, no hardcoded port list.
-async fn refresh_port_roles(rpc: &RpcPoller) -> Result<HashMap<u16, String>, String> {
-    let identity = rpc
-        .call("getIdentity", json!([]))
-        .await
-        .map_err(|e| format!("getIdentity: {e:#}"))?;
-    let pubkey = identity
-        .get("identity")
-        .and_then(|v| v.as_str())
-        .ok_or("getIdentity: no identity field")?
-        .to_string();
-
-    let nodes = rpc
-        .call("getClusterNodes", json!([]))
-        .await
-        .map_err(|e| format!("getClusterNodes: {e:#}"))?;
-    let nodes = nodes.as_array().ok_or("getClusterNodes: not an array")?;
-    let me = nodes
-        .iter()
-        .find(|n| n.get("pubkey").and_then(|v| v.as_str()) == Some(pubkey.as_str()))
-        .ok_or("getClusterNodes: own pubkey not present yet (still gossiping?)")?;
-
-    let mut roles = HashMap::new();
-    if let Some(obj) = me.as_object() {
-        for (key, value) in obj {
-            let Some(addr) = value.as_str() else { continue };
-            let Some((_, port_str)) = addr.rsplit_once(':') else {
-                continue;
-            };
-            let Ok(port) = port_str.parse::<u16>() else {
-                continue;
-            };
-            roles.insert(port, camel_to_snake(key));
-        }
+/// `agave-validator --ledger <path> contact-info` reads the local admin
+/// IPC socket, not the public JSON-RPC port. That matters: getClusterNodes
+/// is gated behind --full-rpc-api, which a production voting validator has
+/// every reason to leave off, so the public RPC route was never reliable
+/// here. The admin socket has no such gate.
+pub(crate) fn refresh_port_roles(ledger: &str) -> Result<HashMap<u16, String>, String> {
+    let out = Command::new("agave-validator")
+        .args(["--ledger", ledger, "contact-info"])
+        .output()
+        .map_err(|e| format!("agave-validator contact-info: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "agave-validator contact-info: exit {}: {}",
+            out.status,
+            stderr.trim()
+        ));
     }
-    Ok(roles)
+    Ok(parse_contact_info(&String::from_utf8_lossy(&out.stdout)))
 }
 
-fn camel_to_snake(s: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i != 0 {
-                out.push('_');
-            }
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
+/// Output is "Label: value" lines, e.g. "TPU Votes: 1.2.3.4:8004". Any line
+/// whose value doesn't end in ":<port>" (Identity, timestamps, ...) is
+/// skipped automatically since the port parse just fails. Port 0 means the
+/// socket is disabled (RPC/RPC Pubsub under --private-rpc); port 1 is
+/// agave's sentinel for "no legacy socket, QUIC only" — neither is a real
+/// bound port, so both are skipped.
+fn parse_contact_info(text: &str) -> HashMap<u16, String> {
+    let mut roles = HashMap::new();
+    for line in text.lines() {
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((_, port_str)) = value.trim().rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port_str.parse::<u16>() else {
+            continue;
+        };
+        if port <= 1 {
+            continue;
         }
+        roles.insert(port, label_to_role(label.trim()));
     }
-    out
+    roles
+}
+
+fn label_to_role(label: &str) -> String {
+    match label {
+        "Gossip" => "gossip",
+        "TVU" => "tvu",
+        "TVU QUIC" => "tvu_quic",
+        "TPU" => "tpu",
+        "TPU QUIC" => "tpu_quic",
+        "TPU Forwards" => "tpu_forwards",
+        "TPU Forwards QUIC" => "tpu_forwards_quic",
+        "TPU Votes" => "tpu_vote",
+        "TPU Votes QUIC" => "tpu_vote_quic",
+        "Serve Repair" => "serve_repair",
+        "Serve Repair QUIC" => "serve_repair_quic",
+        "Repair" => "repair",
+        "RPC" => "rpc",
+        "RPC Pubsub" => "rpc_pubsub",
+        other => return other.to_lowercase().replace(' ', "_"),
+    }
+    .to_string()
 }

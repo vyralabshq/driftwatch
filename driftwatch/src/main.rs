@@ -102,6 +102,11 @@ enum Cmd {
         /// agave-validator PID. Default: auto-detect by matching argv[0].
         #[arg(long)]
         pid: Option<u32>,
+        /// Ledger path, needed to reach the admin socket for socket role
+        /// discovery (contact-info). Without it, layer 4 still tracks
+        /// drops/queues but every socket's role shows as "unknown".
+        #[arg(long)]
+        ledger: Option<String>,
         /// Seconds between fd map / port role rebuilds. Slow on purpose.
         #[arg(long, default_value_t = 30)]
         fd_refresh: u64,
@@ -149,6 +154,7 @@ async fn main() -> Result<()> {
             socket_drop_threshold,
             iface,
             pid,
+            ledger,
             fd_refresh,
             socket_interval,
             dry_run,
@@ -173,11 +179,11 @@ async fn main() -> Result<()> {
             };
 
             if check {
-                return run_check(&dev, &rpc, vote, &iface, pid).await;
+                return run_check(&dev, &rpc, vote, &iface, pid, ledger).await;
             }
 
             eprintln!("driftwatch: using interface {iface}");
-            let mut socket_tracker = sockets::SocketTracker::new(rpc.clone(), pid, fd_refresh);
+            let mut socket_tracker = sockets::SocketTracker::new(pid, fd_refresh, ledger);
             let startup_sockets = socket_tracker.sample().await;
             log_active_layers(&iface, dry_run, self_metrics, &startup_sockets);
             let net = net::NetTracker::new(iface);
@@ -234,12 +240,24 @@ async fn run_check(
     vote: Option<String>,
     iface: &str,
     pid: Option<u32>,
+    ledger: Option<String>,
 ) -> Result<()> {
     let mut ok = true;
 
     match sockets::resolve_pid(pid) {
         Some(found) => println!("[ok]   agave process found: pid {found}"),
         None => println!("[warn] agave process not found (--pid to override), layer 4 will report empty until it starts"),
+    }
+
+    match &ledger {
+        Some(l) => match sockets::refresh_port_roles(l) {
+            Ok(roles) => println!("[ok]   socket role discovery (contact-info): {} ports mapped", roles.len()),
+            Err(e) => {
+                println!("[FAIL] socket role discovery (contact-info): {e}");
+                ok = false;
+            }
+        },
+        None => println!("[warn] --ledger not given, socket roles will show as \"unknown\""),
     }
 
     match load_profiler(dev) {
