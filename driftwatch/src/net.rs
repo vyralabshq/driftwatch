@@ -1,6 +1,5 @@
-// Network ingest, layers 1-3 (pure /proc + /sys reads, no eBPF). Layer 4
-// (per-socket -> agave role attribution) is P1, not implemented here yet;
-// `sockets` is always emitted empty until it lands.
+// Network ingest, layers 1-3 (pure /proc + /sys reads, no eBPF). Layer 4,
+// per-socket attribution to an agave role, lives in sockets.rs.
 //
 // All counters are cumulative-since-boot: emit deltas over the window, and
 // flag counters_reset when any counter went backwards (reboot / iface reset,
@@ -12,6 +11,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const XDP_CACHE_TTL: Duration = Duration::from_secs(60);
+const ETHTOOL_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub struct NetTracker {
     iface: String,
@@ -20,6 +20,8 @@ pub struct NetTracker {
     parse_errors: u64, // cumulative count of failed reads since start
     xdp_cache: Option<bool>,
     xdp_checked_at: Option<Instant>,
+    ethtool_cache: HashMap<String, u64>,
+    ethtool_checked_at: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -62,6 +64,7 @@ pub struct NetSample {
     pub ring: RingDelta,
     pub softnet: SoftnetDelta,
     pub snmp_udp: SnmpUdpDelta,
+    pub ethtool: HashMap<String, u64>, // driver-specific stat name mapped to its value, whatever the NIC exposes
 }
 
 #[derive(Default, Clone, Copy)]
@@ -99,6 +102,8 @@ impl NetTracker {
             parse_errors: 0,
             xdp_cache: None,
             xdp_checked_at: None,
+            ethtool_cache: HashMap::new(),
+            ethtool_checked_at: None,
         }
     }
 
@@ -115,6 +120,22 @@ impl NetTracker {
             self.xdp_checked_at = Some(Instant::now());
         }
         self.xdp_cache
+    }
+
+    /// `ethtool -S`, cached 60s. Driver-specific stat names vary too much
+    /// across NICs to interpret meaningfully here, so this is read
+    /// generically as a name and value pair and left for whoever is
+    /// looking at the JSON to make sense of.
+    fn ethtool_stats(&mut self) -> HashMap<String, u64> {
+        let stale = self
+            .ethtool_checked_at
+            .map(|t| t.elapsed() > ETHTOOL_CACHE_TTL)
+            .unwrap_or(true);
+        if stale {
+            self.ethtool_cache = read_ethtool_stats(&self.iface).unwrap_or_default();
+            self.ethtool_checked_at = Some(Instant::now());
+        }
+        self.ethtool_cache.clone()
     }
 
     /// Cumulative count of failed reads since start, regardless of which window.
@@ -161,6 +182,7 @@ impl NetTracker {
                 iface: self.iface.clone(),
                 is_xdp: self.is_xdp(),
                 counters_reset: true,
+                ethtool: self.ethtool_stats(),
                 ..Default::default()
             });
         }
@@ -181,6 +203,7 @@ impl NetTracker {
             iface: self.iface.clone(),
             is_xdp: self.is_xdp(),
             counters_reset: false,
+            ethtool: self.ethtool_stats(),
             ring: RingDelta {
                 rx_missed_errors: raw.ring.rx_missed_errors - prev.ring.rx_missed_errors,
                 rx_dropped: raw.ring.rx_dropped - prev.ring.rx_dropped,
@@ -303,6 +326,29 @@ fn detect_is_xdp(iface: &str) -> Option<bool> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).contains("prog/xdp"))
+}
+
+/// Reads `ethtool -S <iface>` output as plain name and value pairs. The
+/// stat names are driver-specific and not interpreted here at all, this
+/// just captures whatever the NIC reports. None if `ethtool` fails
+/// (missing binary, no permission, driver doesn't support it).
+fn read_ethtool_stats(iface: &str) -> Option<HashMap<String, u64>> {
+    let out = Command::new("ethtool").args(["-S", iface]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut stats = HashMap::new();
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        stats.insert(name.trim().to_string(), value);
+    }
+    Some(stats)
 }
 
 /// Every path `--check` should verify is readable before a real run.

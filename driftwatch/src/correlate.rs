@@ -1,7 +1,7 @@
 // One line (or JSON) per disk window, validator sample attached.
 // Every alert is an independent static threshold. No composite alert, ever:
-// that AND-gating (slow disk AND high lag) was v1's actual defect. See
-// V2_PLAN.md for the full reasoning.
+// AND-gating slow disk with high lag was the old design's actual defect,
+// since disk latency does not reliably predict vote lag.
 
 use std::{
     collections::VecDeque,
@@ -112,8 +112,8 @@ fn total_cpu_ms() -> i64 {
     user_ms + sys_ms
 }
 
-/// Disk-side result: the alert decision plus the informational median
-/// (never a decision input itself — see V2_PLAN.md §2.1).
+/// Disk-side result: the alert decision plus the informational median.
+/// The median is never a decision input itself, only a reported field.
 struct DiskResult {
     alert: bool,
     median_us: Option<u64>,
@@ -165,8 +165,7 @@ impl AlertEngine {
                 median_us: median_option(&self.disk_median_history),
             };
         }
-        // snapshot before any push: the reported median must never include
-        // this window's own value, same reasoning as the original P0a fix
+        // snapshot before any push: the reported median must never include this window's own value
         let median_us = median_option(&self.disk_median_history);
         let over = w.p99_ns > self.thresholds.disk_latency_ns;
         if over {
@@ -326,7 +325,7 @@ fn median_option(q: &VecDeque<u64>) -> Option<u64> {
     }
     let mut v: Vec<u64> = q.iter().copied().collect();
     v.sort_unstable();
-    Some(v[v.len() / 2] / 1_000) // ns -> us
+    Some(v[v.len() / 2] / 1_000) // convert nanoseconds to microseconds
 }
 
 fn emit(
@@ -423,6 +422,7 @@ fn to_json(
             },
             "sockets": sockets_json,
             "agave_pid": agave_pid,
+            "ethtool": n.ethtool,
             "counters_reset": n.counters_reset,
             "parse_errors": net_parse_errors,
         }),
