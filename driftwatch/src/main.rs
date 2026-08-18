@@ -244,20 +244,22 @@ async fn run_check(
 ) -> Result<()> {
     let mut ok = true;
 
-    match sockets::resolve_pid(pid) {
+    let found_pid = sockets::resolve_pid(pid);
+    match found_pid {
         Some(found) => println!("[ok]   agave process found: pid {found}"),
         None => println!("[warn] agave process not found (--pid to override), layer 4 will report empty until it starts"),
     }
 
-    match &ledger {
-        Some(l) => match sockets::refresh_port_roles(l) {
+    match (found_pid, &ledger) {
+        (Some(found), Some(l)) => match sockets::agave_bin_path(found).and_then(|bin| sockets::refresh_port_roles(&bin, l)) {
             Ok(roles) => println!("[ok]   socket role discovery (contact-info): {} ports mapped", roles.len()),
             Err(e) => {
                 println!("[FAIL] socket role discovery (contact-info): {e}");
                 ok = false;
             }
         },
-        None => println!("[warn] --ledger not given, socket roles will show as \"unknown\""),
+        (None, _) => println!("[warn] agave process not found, skipping socket role discovery"),
+        (_, None) => println!("[warn] --ledger not given, socket roles will show as \"unknown\""),
     }
 
     match load_profiler(dev) {

@@ -85,8 +85,8 @@ impl SocketTracker {
             None => HashSet::new(),
         };
 
-        if let Some(ledger) = &self.ledger {
-            match refresh_port_roles(ledger) {
+        if let (Some(pid), Some(ledger)) = (self.pid, &self.ledger) {
+            match agave_bin_path(pid).and_then(|bin| refresh_port_roles(&bin, ledger)) {
                 Ok(roles) => {
                     self.port_roles = roles;
                     self.last_err = None;
@@ -250,16 +250,30 @@ fn parse_proc_net_udp(path: &str) -> Result<Vec<RawUdpSocket>, String> {
     Ok(out)
 }
 
-/// `agave-validator --ledger <path> contact-info` reads the local admin
-/// IPC socket, not the public JSON-RPC port. That matters: getClusterNodes
-/// is gated behind --full-rpc-api, which a production voting validator has
-/// every reason to leave off, so the public RPC route was never reliable
-/// here. The admin socket has no such gate.
-pub(crate) fn refresh_port_roles(ledger: &str) -> Result<HashMap<u16, String>, String> {
-    let out = Command::new("agave-validator")
+/// The actual binary the running validator was launched from, via
+/// /proc/<pid>/exe. Not "agave-validator" resolved through PATH: driftwatch
+/// usually runs under sudo/systemd with a minimal PATH that doesn't include
+/// wherever the operator's solana-install put it, and this is exact anyway
+/// regardless of PATH.
+pub(crate) fn agave_bin_path(pid: u32) -> Result<String, String> {
+    let path = format!("/proc/{pid}/exe");
+    fs::read_link(&path)
+        .map_err(|e| format!("{path}: {e}"))?
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{path}: not valid utf8"))
+}
+
+/// `<bin> --ledger <path> contact-info` reads the local admin IPC socket,
+/// not the public JSON-RPC port. That matters: getClusterNodes is gated
+/// behind --full-rpc-api, which a production voting validator has every
+/// reason to leave off, so the public RPC route was never reliable here.
+/// The admin socket has no such gate.
+pub(crate) fn refresh_port_roles(bin: &str, ledger: &str) -> Result<HashMap<u16, String>, String> {
+    let out = Command::new(bin)
         .args(["--ledger", ledger, "contact-info"])
         .output()
-        .map_err(|e| format!("agave-validator contact-info: {e}"))?;
+        .map_err(|e| format!("{bin} contact-info: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
