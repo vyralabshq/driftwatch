@@ -251,13 +251,18 @@ async fn run_check(
     }
 
     match (found_pid, &ledger) {
-        (Some(found), Some(l)) => match sockets::agave_bin_path(found).and_then(|bin| sockets::refresh_port_roles(&bin, l)) {
-            Ok(roles) => println!("[ok]   socket role discovery (contact-info): {} ports mapped", roles.len()),
-            Err(e) => {
-                println!("[FAIL] socket role discovery (contact-info): {e}");
-                ok = false;
+        (Some(found), Some(l)) => {
+            let result = sockets::agave_bin_path(found)
+                .and_then(|bin| sockets::agave_uid(found).map(|uid| (bin, uid)))
+                .and_then(|(bin, uid)| sockets::refresh_port_roles(&bin, l, uid));
+            match result {
+                Ok(roles) => println!("[ok]   socket role discovery (contact-info): {} ports mapped", roles.len()),
+                Err(e) => {
+                    println!("[FAIL] socket role discovery (contact-info): {e}");
+                    ok = false;
+                }
             }
-        },
+        }
         (None, _) => println!("[warn] agave process not found, skipping socket role discovery"),
         (_, None) => println!("[warn] --ledger not given, socket roles will show as \"unknown\""),
     }

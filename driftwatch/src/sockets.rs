@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -86,7 +87,10 @@ impl SocketTracker {
         };
 
         if let (Some(pid), Some(ledger)) = (self.pid, &self.ledger) {
-            match agave_bin_path(pid).and_then(|bin| refresh_port_roles(&bin, ledger)) {
+            let result = agave_bin_path(pid)
+                .and_then(|bin| agave_uid(pid).map(|uid| (bin, uid)))
+                .and_then(|(bin, uid)| refresh_port_roles(&bin, ledger, uid));
+            match result {
                 Ok(roles) => {
                     self.port_roles = roles;
                     self.last_err = None;
@@ -264,22 +268,45 @@ pub(crate) fn agave_bin_path(pid: u32) -> Result<String, String> {
         .ok_or_else(|| format!("{path}: not valid utf8"))
 }
 
+/// Real uid the validator runs as, from /proc/<pid>/status. The admin
+/// socket enforces same-uid peer credentials, so even root gets EACCES
+/// connecting from a different uid — the contact-info subprocess has to
+/// run as this exact uid, not whatever driftwatch itself runs as.
+pub(crate) fn agave_uid(pid: u32) -> Result<u32, String> {
+    let path = format!("/proc/{pid}/status");
+    let text = fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            if let Some(real) = rest.split_whitespace().next() {
+                return real
+                    .parse::<u32>()
+                    .map_err(|e| format!("{path}: bad Uid line: {e}"));
+            }
+        }
+    }
+    Err(format!("{path}: no Uid line found"))
+}
+
 /// `<bin> --ledger <path> contact-info` reads the local admin IPC socket,
 /// not the public JSON-RPC port. That matters: getClusterNodes is gated
 /// behind --full-rpc-api, which a production voting validator has every
 /// reason to leave off, so the public RPC route was never reliable here.
-/// The admin socket has no such gate.
-pub(crate) fn refresh_port_roles(bin: &str, ledger: &str) -> Result<HashMap<u16, String>, String> {
+/// The admin socket has no such gate, but does check the connecting
+/// process's uid, hence `uid` here rather than inheriting driftwatch's own.
+pub(crate) fn refresh_port_roles(bin: &str, ledger: &str, uid: u32) -> Result<HashMap<u16, String>, String> {
     let out = Command::new(bin)
         .args(["--ledger", ledger, "contact-info"])
+        .uid(uid)
         .output()
         .map_err(|e| format!("{bin} contact-info: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
         return Err(format!(
-            "agave-validator contact-info: exit {}: {}",
+            "{bin} contact-info: {} stderr: {} stdout: {}",
             out.status,
-            stderr.trim()
+            stderr.trim(),
+            stdout.trim()
         ));
     }
     Ok(parse_contact_info(&String::from_utf8_lossy(&out.stdout)))
