@@ -21,6 +21,7 @@ use crate::{
 };
 
 const HISTORY: usize = 20; // depth of the informational disk-median window
+const MIN_BASELINE_SAMPLES: usize = 5; // below this, a "median" is just noise
 
 /// Every alert threshold, set via CLI flags. Static: nothing here adapts.
 #[derive(Clone, Copy)]
@@ -304,8 +305,12 @@ fn push_capped<T>(q: &mut VecDeque<T>, v: T, cap: usize) {
     q.push_back(v);
 }
 
+/// A median of one or two samples is not a baseline, it is whatever those
+/// samples happened to be. Report nothing until there is enough history for
+/// the number to mean what "median" implies, instead of jumping around on
+/// every push right after a restart.
 fn median_option(q: &VecDeque<u64>) -> Option<u64> {
-    if q.is_empty() {
+    if q.len() < MIN_BASELINE_SAMPLES {
         return None;
     }
     let mut v: Vec<u64> = q.iter().copied().collect();

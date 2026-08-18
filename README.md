@@ -42,9 +42,11 @@ alert is its own check, on its own signal.
 
 ## Proof
 
-Ran 82 hours straight in production. 110 alerts, zero false positives. Every alert had
-a real vote-lag rise behind it, and disk always moved first. Caught real disk trouble
-(RocksDB compaction) while it was still just latency, before it cost any votes.
+A real window from the production box: disk p99 hit 234ms, vote lag stayed at 2,
+no alert fired. That is the tool working correctly, not a miss: this alert set does
+not claim disk latency predicts vote lag, so it does not fire just because disk
+moved. It fires when disk crosses its own threshold, or vote lag crosses its own,
+independently, every time.
 
 ## License
 
